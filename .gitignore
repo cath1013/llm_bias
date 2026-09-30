@@ -1,0 +1,22 @@
+# Secrets / environment
+.env
+
+# Python environment
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Editor / local tooling
+.vscode/
+.claude/
+
+# Local backups
+.file_backups/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Large local reference materials
+ref/
