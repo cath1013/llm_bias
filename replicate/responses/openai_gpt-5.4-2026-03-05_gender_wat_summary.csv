@@ -1,0 +1,2 @@
+dataset,n_valid,mean_D,sd_D,t_vs_0,n_pos,n_neg,mean_unparsed
+power,50,0.915,0.376,17.21,48,2,0.0
