@@ -54,9 +54,12 @@ PROVIDER_DEFAULTS = {
     # (e.g. --model scout-ctx); note the *-ctx builds PIN num_ctx to 4096 despite the
     # name, so they are narrower than the bare model, not wider.
     "ollama":    "gpt-oss:120b",                                # local/remote Ollama
+    # Downloaded HF checkpoint served by local_llama_server.py (see that file).
+    "local":     "llama3.1:8b-instruct",
 }
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+LOCAL_BASE_URL = os.getenv("LOCAL_LLM_BASE_URL", "http://127.0.0.1:8101/v1")
 TEMPERATURE = 1.0
 N_ITERATIONS = 50
 SYSTEM_PROMPT = "You are a helpful assistant."
@@ -147,9 +150,27 @@ def _call_ollama(model, messages, temperature):
                                           extra_body={"keep_alive": "30m"})
     return (resp.choices[0].message.content or "").strip()
 
+def _call_local(model, messages, temperature):
+    """Downloaded HF checkpoint, served by `local_llama_server.py` on this box.
+
+    Deliberately NOT folded into the ollama branch.  The project `.env` sets
+    OLLAMA_BASE_URL and is loaded with override=True, so an exported
+    OLLAMA_BASE_URL is silently discarded; LOCAL_LLM_BASE_URL is not in `.env`
+    and survives.  Keeping it a separate provider also records in every output
+    row that the session came from the checkpoint, not from the Ollama host.
+    """
+    from openai import OpenAI
+    base = os.getenv("LOCAL_LLM_BASE_URL", "").strip() or LOCAL_BASE_URL
+    client = OpenAI(api_key="local", base_url=base, timeout=1800.0, max_retries=2)
+    resp = client.chat.completions.create(model=model, messages=messages,
+                                          temperature=temperature)
+    return (resp.choices[0].message.content or "").strip()
+
+
 _DISPATCH = {"openai": _call_openai, "anthropic": _call_anthropic,
              "gemini": _call_gemini, "llama": _call_llama_via_groq,
-             "ollama": _call_ollama}
+             "ollama": _call_ollama,
+             "local": _call_local}
 
 def call_model(provider, model, messages, temperature):
     if provider not in _DISPATCH:
