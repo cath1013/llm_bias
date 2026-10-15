@@ -116,23 +116,25 @@ STIMULI — reused, not re-typed  (--descriptors)
               arm where it does not -- both poles are then Storage's, exactly as in the
               WAT.
 
-    inventive (--inventive) A ONE-WORD LEXICAL VARIANT of creativity4, and the only
-              stimulus manipulation in this file that is not a choice between published
-              lists. creativity4's fourth item, `original`, is the item we added, so it
-              is the one word with no source to be faithful to -- and it is polysemous:
-              besides "inventive" it means "not a copy" ("the original manuscript"),
-              a sense a role-requirement frame can plausibly activate as authenticity
-              rather than creative ability. --inventive substitutes a synonym carrying
-              only the creative sense, in whichever form the frame needs:
-                  be        original     -> inventive
-                  requires  originality  -> inventiveness
-              Same rate across the two variants = the polysemy is inert and `original`
-              is fine to report; a gap = the word was doing work, and that gap is itself
-              the result. NOTE the cost: with --inventive the control pole no longer
-              matches wat_gender_brilliance.py's creativity4, which still sorts
-              `original`, so an --inventive run is NOT the WAT's word-for-word twin.
-              Only creativity4 contains the word; the flag errors on any other --control
-              rather than silently doing nothing.
+    variants  (--inventive / --unique) ALTERNATIVE WORDINGS of creativity4's fourth
+              item, and the only stimulus choice in this file not taken from a published
+              list. Storage's creativity set is the three words beside it; `original` is
+              ours, so the arm should not rest on one arbitrary choice of word for that
+              slot. Each flag substitutes a different wording of the same creativity item,
+              in whichever form the frame needs:
+                  be        original     -> inventive   | unique
+                  requires  originality  -> inventiveness | uniqueness
+              Running several makes the result independent of which synonym was typed.
+              Mutually exclusive, and each errors on any other --control, since only
+              creativity4 contains the word.
+              THE ADJECTIVE HALF IS THE WAT'S, imported from wat_gender_brilliance.py,
+              which carries the same flags on the same slot -- so `--control creativity4
+              --unique` here and in the WAT are the same contrast, and the
+              WAT-vs-decision comparison holds per variant, not just for `original`.
+              The noun half is ours (CONTROL_VARIANTS below), which is why this file
+              exposes fewer variants than the WAT: one appears here only once its noun
+              form is decided. The WAT's innovative / resourceful / visionary have none
+              yet.
 
     people    (--people) NAMES by default: Bai's own power-condition group stimuli,
               dataset `power` column A/B — Eric / Jason / Peter / Steve vs Dianne /
@@ -177,9 +179,10 @@ USAGE
     python gender_decision_adj.py --provider openai --descriptors storage --control warmth --n 300 --balance-words --workers 6
     python gender_decision_adj.py --provider openai --descriptors storage --control creativity4 --n 300 --balance-words --workers 6
     python gender_decision_adj.py --provider openai --descriptors storage --control creativity4 --inventive --n 300 --balance-words --workers 6
+    python gender_decision_adj.py --provider openai --descriptors storage --control creativity4 --unique --n 300 --balance-words --workers 6
 
     
-Outputs: responses/gender decision adj/<provider>_<model>_gadj_<descriptors>[_<control>][_<brilliance>][_inventive]_<relation>_<people>[_<pair>]_decision.xlsx
+Outputs: responses/gender decision adj/<provider>_<model>_gadj_<descriptors>[_<control>][_<brilliance>][_<variant>]_<relation>_<people>[_<pair>]_decision.xlsx
 Note: this script lives at the project root but imports bai_core from replicate/.
 """
 
@@ -206,7 +209,8 @@ from bai_core import (PROVIDER_DEFAULTS, SYSTEM_PROMPT, TEMPERATURE, N_ITERATION
 
 from wat_gender_brilliance import (MALE_WORDS, FEMALE_WORDS, GENDER_PAIRS,
                                    CONTROL_SETS as WAT_CONTROL_SETS,
-                                   ADJ_EFFORT_WORDS, resolve_brilliance)
+                                   ADJ_EFFORT_WORDS, resolve_brilliance,
+                                   CONTROL_VARIANTS as _ADJ_VARIANTS)
 # Leslie's own FAB survey items (the WAT poles) and Bian's job-description phrases.
 # Aliased on import so the two sources stay distinguishable at every use site.
 from wat_fab import (BRILLIANCE_WORDS as LESLIE_BRILLIANCE,
@@ -313,56 +317,64 @@ CONTROL_CHOICES = ["effort"] + list(CONTROL_NOUN_SETS)
 CONTROL_FORMS = {"requires": CONTROL_NOUN_SETS, "be": WAT_CONTROL_SETS}
 
 # =========================================================
-# --inventive : a one-word lexical variant of creativity4
+# Lexical variants of creativity4  (--inventive / --unique)
 #
-# `original` is the item WE added to Storage's creativity set (see CONTROL_NOUN_SETS),
-# so unlike every other stimulus in this file it is not anchored to a published list --
-# which makes it the one word worth testing an alternative for. `original` is polysemous
-# in a way that matters here: besides "inventive" it means "the first / not a copy"
-# ("the original manuscript"), and in a job-requirement frame a model may read it as
-# authenticity rather than creative ability. `inventive` carries only the creative sense.
-# If the two variants give the same rate, the polysemy is not doing any work and
-# `original` can be reported; if they diverge, that difference is the finding.
+# `original` is the one item in creativity4 with no published source behind it (Storage's
+# own set is the three words beside it), so the arm should not rest on a single arbitrary
+# choice of word for that slot. Each variant is an alternative wording of the same
+# creativity item; running several makes the result independent of which synonym was
+# typed. wat_gender_brilliance.py carries the same flags on the same slot.
 #
-# BOTH forms swap, so the flag means the same thing in either grammatical frame:
-#     be        original     -> inventive       ("someone who is inventive")
-#     requires  originality  -> inventiveness   ("requires inventiveness")
-# Applied at POLE-RESOLUTION time, so the swapped word is what gets drawn, stored in
-# `effort_desc`, rendered, and shown to the judge -- there is no second place that could
-# fall out of step.
-# =========================================================
-INVENTIVE_SWAP = {
-    "original":    "inventive",
-    "originality": "inventiveness",
+# WHY THIS FILE NEEDS ITS OWN TABLE. The WAT sorts bare ADJECTIVES, so its registry only
+# ever needs {original: <adj>}. This file has two frames, and the `requires` frame takes
+# a NOUN (CONTROL_NOUN_SETS), so every variant needs a second mapping:
+#     be        original     -> inventive      ("someone who is inventive")
+#     requires  originality  -> inventiveness  ("requires inventiveness")
+# The ADJECTIVE half is imported from the WAT rather than re-typed, so the two files
+# cannot drift onto different words while both call the flag --inventive. The NOUN half
+# is ours, and is why this file exposes FEWER variants than the WAT does: a variant
+# appears here only once its noun form has been decided. The WAT's `innovative`,
+# `resourceful` and `visionary` have no entry yet for that reason.
+_NOUN_FORMS = {
+    "inventive": {"originality": "inventiveness"},   # standard nominalization
+    "unique":    {"originality": "uniqueness"},      # ditto; mass noun, takes no article
 }
-# Same guard the WAT applies to its control sets: a substring overlap in either direction
-# with a brilliance word would make the two poles impossible to tell apart downstream.
-for _w in INVENTIVE_SWAP.values():
-    for _bset in ("storage4", "storage3"):
-        for _b in (x.lower() for x in resolve_brilliance("warmth", _bset)[1]):
-            assert _w not in _b and _b not in _w, f"'{_w}' collides with '{_b}'"
+CONTROL_VARIANTS = {v: {**_ADJ_VARIANTS[v], **_NOUN_FORMS[v]} for v in _NOUN_FORMS}
+# The adjective halves must still be the WAT's, spelled out so a silent divergence fails
+# here rather than in a run.
+assert CONTROL_VARIANTS["inventive"]["original"] == "inventive"
+assert CONTROL_VARIANTS["unique"]["original"] == "unique"
 
-def control_has_swap(control):
-    """True if --inventive would actually change this control set's words."""
+# Same guard the WAT applies: no swapped-in word may be a substring of a brilliance word
+# or vice versa, in either direction.
+for _vname, _swap in CONTROL_VARIANTS.items():
+    for _w in _swap.values():
+        for _bset in ("storage4", "storage3"):
+            for _b in (x.lower() for x in resolve_brilliance("warmth", _bset)[1]):
+                assert _w not in _b and _b not in _w, f"{_vname}: '{_w}' collides with '{_b}'"
+
+def control_has_swap(control, variant):
+    """True if `variant` would actually change this control set's words, in either frame."""
     if control == "effort":
         return False
-    return any(w in INVENTIVE_SWAP
+    return any(w in CONTROL_VARIANTS[variant]
                for form in CONTROL_FORMS.values() for w in form[control])
 
-def resolve_poles(descriptors, control, brilliance="auto", inventive=False):
+def resolve_poles(descriptors, control, brilliance="auto", variant=""):
     """(brilliance_pool, contrast_pool, frame) for a --descriptors x --control pair.
 
     `brilliance` picks Storage's 4-word or 3-word brilliance set and applies to
     --descriptors storage only; "auto" defers to the WAT's own pairing.
-    `inventive` swaps original/originality for inventive/inventiveness (creativity4)."""
+    `variant` names a CONTROL_VARIANTS substitution for creativity4's fourth word."""
     bril, eff, frame = DESCRIPTOR_SETS[descriptors]
     if bril is None:                                   # storage: set chosen by control
         _, bril = resolve_brilliance(control, brilliance)
     if control == "effort":
         return list(bril), list(eff), frame
     ctl = list(CONTROL_FORMS[frame][control])
-    if inventive:
-        ctl = [INVENTIVE_SWAP.get(w, w) for w in ctl]
+    swap = CONTROL_VARIANTS.get(variant) if variant else None
+    if swap:
+        ctl = [swap.get(w, w) for w in ctl]
     return list(bril), ctl, frame
 
 def brilliance_set_name(descriptors, control, brilliance="auto"):
@@ -627,22 +639,23 @@ def _draw_people(rng, people_mode, gender_pair):
 def run_trial(i, provider, model, temperature, judge_provider, judge_model,
               descriptors="leslie", relation="colleagues", gender_pair=None,
               seed=1, words=None, people_mode="names", control="effort",
-              brilliance="auto", inventive=False):
+              brilliance="auto", variant=""):
     timestamp = datetime.now(timezone.utc).isoformat()
     bril_pool, eff_pool, frame = resolve_poles(descriptors, control, brilliance,
-                                               inventive)
+                                               variant)
     # PER-TRIAL generator seeded from the design + trial index: reproducible and
     # order-independent, so --workers changes only the wall clock. `control` enters the
     # seed only when it is NOT the default, so every effort run keeps the exact stimulus
     # stream it had before --control existed.
     # `brilliance` likewise enters only when overridden, so a --descriptors storage run
     # on Storage's own pairing keeps one canonical stimulus stream per control.
-    # `inventive` likewise: an un-swapped creativity4 run keeps the stimulus stream it
-    # had before the flag existed, so the two variants are separate streams, not a
-    # re-labelling of one.
+    # `variant` likewise: an un-swapped creativity4 run keeps the stimulus stream it had
+    # before the flags existed, and each variant gets its own stream. The key is the
+    # variant NAME, so the --inventive run already on disk is unaffected by --unique
+    # being added beside it.
     ctl_key = "" if control == "effort" else f"|{control}"
     bril_key = "" if brilliance == "auto" else f"|{brilliance}"
-    inv_key = "|inventive" if inventive else ""
+    inv_key = f"|{variant}" if variant else ""
     rng = random.Random(zlib.crc32(
         f"{descriptors}|{relation}|{people_mode}|{gender_pair}"
         f"{ctl_key}{bril_key}{inv_key}|{i}".encode()) ^ seed)
@@ -666,7 +679,7 @@ def run_trial(i, provider, model, temperature, judge_provider, judge_model,
                brilliance_set=brilliance_set_name(descriptors, control, brilliance),
                # which lexical variant of the control set was used; "" = the set as
                # CONTROL_NOUN_SETS/WAT_CONTROL_SETS define it
-               control_variant="inventive" if inventive else "",
+               control_variant=variant,
                relation=relation,
                people=people_mode, gender_pair=gender_pair or "random",
                balanced_words=int(words is not None),
@@ -798,10 +811,10 @@ def summarize(df, tag):
     if bset and bset != "nan":
         print(f"brilliance words: Storage 2020 {bset}, verbatim — same pole as "
               f"wat_gender_brilliance.py --control {ctl if ctl != 'effort' else 'dedication_adj'}")
-    if variant == "inventive":
-        print("control variant: --inventive — original -> inventive / originality -> "
-              "inventiveness\n                 (NOT word-matched to the WAT's "
-              "creativity4, which still uses `original`)")
+    if variant:
+        sw = CONTROL_VARIANTS[variant]
+        print(f"control variant: --{variant} — "
+              + " / ".join(f"{k} -> {v}" for k, v in sw.items()))
     print("congruent = the MALE word routed to the BRILLIANCE-requiring role; chance = 0.5")
     print(f"  > 0.5 stereotype-congruent (brilliance -> man, {other} -> woman)")
     print("  < 0.5 anti-stereotype")
@@ -891,13 +904,17 @@ def main():
                          "from wat_gender_brilliance.resolve_brilliance (storage3 with "
                          "creativity, storage4 otherwise), so the decision arm and the "
                          "WAT arm contain the same words")
-    ap.add_argument("--inventive", action="store_true",
-                    help="--control creativity4 ONLY: replace the one non-Storage item "
-                         "in that set with a synonym that lacks its second sense — "
-                         "original -> inventive (adjective frame), originality -> "
-                         "inventiveness (noun frame). `original` also means 'not a copy', "
-                         "which a role-requirement frame may read as authenticity rather "
-                         "than creative ability; `inventive` cannot. Run both and compare")
+    # One slot, so at most one substitute: argparse enforces it rather than the last
+    # flag silently winning and the filename naming a variant that did not run.
+    _vg = ap.add_mutually_exclusive_group()
+    for _v in CONTROL_VARIANTS:
+        _adj, _noun = CONTROL_VARIANTS[_v]["original"], CONTROL_VARIANTS[_v]["originality"]
+        _vg.add_argument(f"--{_v}", action="store_true",
+                         help=f"--control creativity4 ONLY: replace that set's one "
+                              f"non-Storage item — original -> {_adj} (adjective frame), "
+                              f"originality -> {_noun} (noun frame). An alternative "
+                              f"wording of the same creativity item; "
+                              f"wat_gender_brilliance.py offers the same flag")
     ap.add_argument("--relation", default="colleagues", choices=list(RELATIONS),
                     help="Task 1 relation clause. colleagues = Bai's power wording "
                          "(default, and what Task 2's project frame implies); "
@@ -942,15 +959,16 @@ def main():
     jp = args.judge_provider
     jm = args.judge_model or PROVIDER_DEFAULTS[jp]
     gender_pair = None if args.gender_pair == "random" else args.gender_pair
+    control_variant = next((v for v in CONTROL_VARIANTS if getattr(args, v)), "")
     bril_pool, eff_pool, frame = resolve_poles(args.descriptors, args.control,
-                                               args.brilliance, args.inventive)
+                                               args.brilliance, control_variant)
     bset = brilliance_set_name(args.descriptors, args.control, args.brilliance)
     # creativity4 is the only set containing `original`, so anywhere else the flag would
     # silently do nothing and the filename would claim a variant that never ran.
-    if args.inventive and not control_has_swap(args.control):
-        ap.error(f"--inventive has no effect on --control {args.control}: only "
+    if control_variant and not control_has_swap(args.control, control_variant):
+        ap.error(f"--{control_variant} has no effect on --control {args.control}: only "
                  f"creativity4 contains `original`/`originality`. Use --control "
-                 f"creativity4, or drop --inventive.")
+                 f"creativity4, or drop --{control_variant}.")
     # leslie/bian take their brilliance pole from the descriptor set itself, so a
     # --brilliance here would silently do nothing. Say so rather than accept it.
     if args.brilliance != "auto" and not bset:
@@ -974,7 +992,7 @@ def main():
         # 1 would be, so what is printed is what the run would actually send.
         ctl_key = "" if args.control == "effort" else f"|{args.control}"
         bril_key = "" if args.brilliance == "auto" else f"|{args.brilliance}"
-        inv_key = "|inventive" if args.inventive else ""
+        inv_key = f"|{control_variant}" if control_variant else ""
         rng = random.Random(zlib.crc32(
             f"{args.descriptors}|{args.relation}|{args.people}|{gender_pair}"
             f"{ctl_key}{bril_key}{inv_key}|1".encode()) ^ args.seed)
@@ -986,7 +1004,7 @@ def main():
         roles = [bw, ew] if rng.random() > 0.5 else [ew, bw]
         print(f"[dry run] descriptors={args.descriptors} (frame={frame}"
               f"{', ' + bset if bset else ''})  "
-              f"control={args.control}{' +inventive' if args.inventive else ''}  "
+              f"control={args.control}{' +' + control_variant if control_variant else ''}  "
               f"relation={args.relation}  "
               f"people={args.people}\n          "
               f"male={mword}  female={fword}  brilliance={bw!r}  contrast={ew!r}\n")
@@ -1007,8 +1025,9 @@ def main():
              "" if args.control == "effort" else
              "  [Storage 2020, verbatim adjectives]" if frame == "be" else
              "  [Storage 2020, noun forms, derived]")
-          + ("   +--inventive (original -> inventive / originality -> inventiveness)"
-             if args.inventive else ""))
+          + (f"   +--{control_variant} ("
+             + " / ".join(f"{k} -> {v}" for k, v in CONTROL_VARIANTS[control_variant].items())
+             + ")" if control_variant else ""))
     print(f"relation    : {args.relation!r} -> \"...about {{g0}} and {{g1}}"
           f"{RELATIONS[args.relation]}.\"")
     m_pool, f_pool = PEOPLE_SETS[args.people]
@@ -1037,7 +1056,7 @@ def main():
                          args.relation, gender_pair, args.seed,
                          words=sched[i - 1] if sched else None,
                          people_mode=args.people, control=args.control,
-                         brilliance=args.brilliance, inventive=args.inventive)
+                         brilliance=args.brilliance, variant=control_variant)
 
     # ex.map preserves input order, so `rows` comes back trial-ordered; only the
     # progress prints interleave.
@@ -1057,7 +1076,7 @@ def main():
     bril_tag = "" if args.brilliance == "auto" else f"_{args.brilliance}"
     # same rule again: named only when set, so the two creativity4 variants land in
     # separate files and existing runs keep their names
-    inv_tag = "_inventive" if args.inventive else ""
+    inv_tag = f"_{control_variant}" if control_variant else ""
     tag = (f"{provider}_{_slug(model)}_gadj_{args.descriptors}{ctl_tag}{bril_tag}"
            f"{inv_tag}_{args.relation}_{args.people}{pair_tag}")
     out = os.path.join(OUTPUT_DIR, f"{tag}_decision.xlsx")
