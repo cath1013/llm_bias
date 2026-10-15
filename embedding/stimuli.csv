@@ -1,0 +1,65 @@
+﻿dataset,condition,stimulus_type,role,stimulus
+gender_brilliance,all,target,male,boy
+gender_brilliance,all,target,male,father
+gender_brilliance,all,target,male,grandpa
+gender_brilliance,all,target,male,husband
+gender_brilliance,all,target,male,male
+gender_brilliance,all,target,male,man
+gender_brilliance,all,target,male,son
+gender_brilliance,all,target,male,uncle
+gender_brilliance,all,target,female,aunt
+gender_brilliance,all,target,female,daughter
+gender_brilliance,all,target,female,female
+gender_brilliance,all,target,female,girl
+gender_brilliance,all,target,female,grandma
+gender_brilliance,all,target,female,mother
+gender_brilliance,all,target,female,wife
+gender_brilliance,all,target,female,woman
+gender_brilliance,all,attribute,brilliance,brainiac
+gender_brilliance,all,attribute,brilliance,brilliant
+gender_brilliance,all,attribute,brilliance,genius
+gender_brilliance,all,attribute,brilliance,super smart
+gender_brilliance,creativity,attribute,control,artistic
+gender_brilliance,creativity,attribute,control,creative
+gender_brilliance,creativity,attribute,control,original
+gender_brilliance,creativity,attribute,control,super-imaginative
+gender_brilliance,warmth,attribute,control,chatty
+gender_brilliance,warmth,attribute,control,kindly
+gender_brilliance,warmth,attribute,control,outgoing
+gender_brilliance,warmth,attribute,control,very friendly
+gender_brilliance,humor,attribute,control,entertaining
+gender_brilliance,humor,attribute,control,hilarious
+gender_brilliance,humor,attribute,control,very funny
+gender_brilliance,humor,attribute,control,witty
+gender_brilliance,dedication,attribute,control,hardworking
+gender_brilliance,dedication,attribute,control,motivated
+gender_brilliance,dedication,attribute,control,persistent
+gender_brilliance,dedication,attribute,control,very dedicated
+fab,all,pole,brilliance,innate gift
+fab,all,pole,brilliance,innate talent
+fab,all,pole,brilliance,raw ability
+fab,all,pole,brilliance,special aptitude
+fab,all,pole,effort,dedication
+fab,all,pole,effort,hard work
+fab,all,pole,effort,motivation
+fab,all,pole,effort,sustained effort
+fab,tertile,field,high_fab,philosophy
+fab,tertile,field,high_fab,math
+fab,tertile,field,high_fab,music composition
+fab,tertile,field,high_fab,english literature
+fab,tertile,field,high_fab,physics
+fab,tertile,field,high_fab,economics
+fab,tertile,field,high_fab,classics
+fab,tertile,field,high_fab,engineering
+fab,tertile,field,high_fab,computer science
+fab,tertile,field,high_fab,comparative literature
+fab,tertile,field,low_fab,history
+fab,tertile,field,low_fab,molecular biology
+fab,tertile,field,low_fab,neuroscience
+fab,tertile,field,low_fab,communications
+fab,tertile,field,low_fab,sociology
+fab,tertile,field,low_fab,archaeology
+fab,tertile,field,low_fab,earth science
+fab,tertile,field,low_fab,anthropology
+fab,tertile,field,low_fab,psychology
+fab,tertile,field,low_fab,education
