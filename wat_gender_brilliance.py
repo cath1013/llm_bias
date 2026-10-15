@@ -46,6 +46,19 @@ STIMULI
                      with storage4 and keeps `brainiac`. `original` is OURS, not in
                      Storage 2020 -- see CONTROL_SETS. `creativity` is left verbatim
                      and still the set to report when faithfulness is the point.)
+                    --inventive / --innovative / --unique / --resourceful / --visionary
+                     each SUBSTITUTE for that one word (never add to it -- the set stays 4
+                     words, so the storage4 pairing holds). They are the SAME creativity
+                     control, worded differently: `original` is the only item here with no
+                     published source behind it, so the arm should not rest on one
+                     arbitrary choice of word for that slot. Running several makes the
+                     result independent of which synonym was typed -- D_gb and word-level
+                     P(male) holding across them means the finding is a property of the
+                     control; one moving points at that word rather than the conclusion.
+                     Mutually exclusive, and all error on any other --control since no
+                     other set contains the word.
+                     gender_decision_adj.py carries --inventive on the same word,
+                     importing INVENTIVE_SWAP from here (it has no --innovative yet).
         dedication: hard work, dedication, motivation, sustained effort
                     (Leslie 2015 FAB survey items, verbatim, imported from wat_fab.py)
         dedication_adj: hardworking, very dedicated, motivated, persistent
@@ -53,31 +66,7 @@ STIMULI
                     verbatim from any source; see ADJ_EFFORT_WORDS for the item-by-item
                     derivation and the one real rewrite)
 
-    WHY `dedication` IS A DIFFERENT KIND OF CONTROL
-      Storage's controls are traits that simply are NOT brilliance (warm, funny,
-      beautiful): they answer "is brilliance male relative to some other positive
-      trait?". `dedication` is the theoretically-paired OPPOSITE POLE — in the FAB
-      literature (Leslie 2015) brilliance and effort are the two ends of ONE axis, and
-      these are Leslie's own survey words, the same poles wat_fab.py sorts fields
-      between. With --control dedication, D_gb becomes exactly the brilliance-vs-effort
-      gender axis that fab_decision.py and gender_decision_adj.py measure as DECISIONS,
-      so the WAT and the decision tasks finally share both poles and both groups.
-      Expect a LARGER effect than warmth if the stereotype is real: "hardworking" is
-      itself female-stereotyped in human data, so the two poles push the same way,
-      whereas warmth-as-control only has the brilliance side pushing.
-      GRAMMATICAL CLASS — why there are TWO dedication sets. Storage's brilliance set
-      is 2 adjectives + 2 nouns (super smart, brilliant / genius, brainiac) and every
-      Storage CONTROL set is adjectival with exactly one "very X" item. Leslie's effort
-      items are 4 nouns, so `dedication` is the odd one out on both counts, and
-      analyze_brilliance_word.py already found the brilliance words' own ordering looks
-      noun-vs-adjective. Part of any dedication effect could therefore be class rather
-      than content. Rather than guess, run BOTH: `dedication` (source-faithful) and
-      `dedication_adj` (class-matched to the other controls). If D_gb agrees across the
-      two, class is not driving it and the verbatim set is the one to report; if they
-      diverge, that difference is itself the finding and neither should be reported
-      alone. A third angle, if wanted: Leslie's BRILLIANCE nouns against Leslie's
-      effort nouns — fully class-matched on both sides — which is exactly wat_fab.py's
-      pair of poles, applied to gender words instead of fields.
+
     Gender group words (Bai et al. 2025, gender x science stimuli, lowercased):
         male  : man, boy, father, male, grandpa, husband, son, uncle
         female: girl, female, aunt, daughter, wife, woman, mother, grandma
@@ -94,7 +83,12 @@ SCORING  (per session; session = unit; raw stored so re-derivable)
 USAGE
     python wat_gender_brilliance.py --provider anthropic --control warmth --n 50
     python wat_gender_brilliance.py --provider openai --control creativity --n 50      # 3 vs 3 setting
-    python wat_gender_brilliance.py --provider openai --control creativity4 --n 50    # same as creativity, but with original
+    python wat_gender_brilliance.py --provider openai --control creativity4 --n 150    # same as creativity, but with original
+    python wat_gender_brilliance.py --provider openai --control creativity4 --inventive --n 150   # ... with `inventive` instead
+    python wat_gender_brilliance.py --provider openai --control creativity4 --innovative --n 150  # ... with `innovative` instead
+    python wat_gender_brilliance.py --provider openai --control creativity4 --unique --n 150      # ... with `unique` instead
+    python wat_gender_brilliance.py --provider openai --control creativity4 --resourceful --n 150 # ... with `resourceful` instead
+    python wat_gender_brilliance.py --provider openai --control creativity4 --visionary --n 150   # ... with `visionary` instead
     python wat_gender_brilliance.py --provider openai --control dedication --n 50
     python wat_gender_brilliance.py --provider openai --control dedication_adj --n 50
     python wat_gender_brilliance.py --provider openai --control creativity --brilliance storage4 --n 150   # forces the old 4v3
@@ -130,9 +124,12 @@ PROVIDER_DEFAULTS = {
     "gemini":    "gemini-3.6-flash",
     "llama":     "meta-llama/llama-4-scout-17b-16e-instruct",
     "ollama":    "gpt-oss:120b",                                # local/remote Ollama
+    # Downloaded HF checkpoint served by local_llama_server.py (see that file).
+    "local":     "llama3.1:8b-instruct",
 }
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+LOCAL_BASE_URL = os.getenv("LOCAL_LLM_BASE_URL", "http://127.0.0.1:8101/v1")
 
 TEMPERATURE = 1.0
 N_SESSIONS = 50
@@ -234,6 +231,69 @@ for _name, _words in CONTROL_SETS.items():
         for _bset in BRILLIANCE_SETS.values():
             for _b in (w.lower() for w in _bset):
                 assert _c not in _b and _b not in _c, f"{_name}: '{_c}' collides with '{_b}'"
+
+# =========================================================
+# --inventive : a one-word lexical variant of creativity4
+#
+# `original` is the item WE added to Storage's creativity set (see CONTROL_SETS above),
+# so unlike every other word sorted by this WAT it is not anchored to a published list --
+# which makes it the one word worth testing an alternative for. It is also polysemous in
+# a way that could matter: besides "inventive" it means "not a copy" ("the original
+# manuscript"), a sense that has nothing to do with creativity as a trait and that a
+# model may well carry into a bare word-sorting task. `inventive` has only the creative
+# sense. Same P(male) across the two = the polysemy is inert and `original` is fine to
+# report; a gap = the word was doing work, and the gap is the finding.
+#
+# CANONICAL COPY, like ADJ_EFFORT_WORDS: gender_decision_adj.py imports this dict and
+# extends it with the NOUN form its `requires` frame needs (originality ->
+# inventiveness). Importing the other way would be a cycle, and keeping one source for
+# the ADJECTIVE swap is what stops the WAT and the decision task from drifting onto
+# different words while both call the flag --inventive.
+# =========================================================
+# One entry per --<name> flag. Each is a SUBSTITUTION, not an addition: the variant word
+# takes `original`'s slot, so the set stays 4 words and keeps the 4v4 pairing with
+# storage4 that is the entire reason creativity4 exists. Adding a fifth word instead
+# would give 5v4 -- the unbalanced pairing main() warns about and no Storage study ran.
+# All of these are the SAME creativity control as `original`, worded differently -- not a
+# ladder, not a set of different constructs. `original` is the one item in creativity4
+# with no published source behind it (Storage's own set is the three words beside it), so
+# the arm should not rest on a single arbitrary choice of word for that fourth slot. Each
+# variant is an alternative wording of it, and running several turns the question into one
+# that does not depend on which synonym happened to get typed: if D_gb and the word-level
+# P(male) hold across them, the result is a property of the control; if one moves, that
+# word is what to look at, not the conclusion.
+#
+# Mutually exclusive at the CLI -- one slot, one word -- and each is recorded in
+# `control_variant` and in the filename, so two arms can never be mixed in one file.
+CONTROL_VARIANTS = {
+    "inventive":   {"original": "inventive"},
+    "innovative":  {"original": "innovative"},
+    "unique":      {"original": "unique"},
+    "resourceful": {"original": "resourceful"},
+    "visionary":   {"original": "visionary"},
+}
+# gender_decision_adj.py imports THIS name and extends it with the NOUN form its
+# `requires` frame needs. Kept as an explicit alias rather than having that file index
+# CONTROL_VARIANTS, so the cross-file dependency is visible from both ends.
+INVENTIVE_SWAP = CONTROL_VARIANTS["inventive"]
+
+# Same guard as above: every swapped-in word has to survive match_attr's two-way
+# substring test against every brilliance word, or it would be silently mis-categorised.
+for _vname, _swap in CONTROL_VARIANTS.items():
+    for _w in _swap.values():
+        for _bset in BRILLIANCE_SETS.values():
+            for _b in (x.lower() for x in _bset):
+                assert _w not in _b and _b not in _w, f"{_vname}: '{_w}' collides with '{_b}'"
+
+def resolve_control(control_name, variant=""):
+    """The control word list, with a CONTROL_VARIANTS substitution applied if named."""
+    words = list(CONTROL_SETS[control_name])
+    swap = CONTROL_VARIANTS.get(variant) if variant else None
+    return [swap.get(w, w) for w in words] if swap else words
+
+def control_has_swap(control_name, variant):
+    """True if `variant` would actually change this control set's words."""
+    return any(w in CONTROL_VARIANTS[variant] for w in CONTROL_SETS[control_name])
 
 # Bai et al. (2025) gender stimulus lists (lowercased, as Bai used them)
 MALE_WORDS   = ["man", "boy", "father", "male", "grandpa", "husband", "son", "uncle"]
@@ -341,9 +401,27 @@ def _call_ollama(model, messages, temperature):
         extra_body={"keep_alive": "30m"})
     return (resp.choices[0].message.content or "").strip()
 
+def _call_local(model, messages, temperature):
+    """Downloaded HF checkpoint, served by `local_llama_server.py` on this box.
+
+    Deliberately NOT folded into the ollama branch.  The project `.env` sets
+    OLLAMA_BASE_URL and is loaded with override=True, so an exported
+    OLLAMA_BASE_URL is silently discarded; LOCAL_LLM_BASE_URL is not in `.env`
+    and survives.  Keeping it a separate provider also records in every output
+    row that the session came from the checkpoint, not from the Ollama host.
+    """
+    from openai import OpenAI
+    base = os.getenv("LOCAL_LLM_BASE_URL", "").strip() or LOCAL_BASE_URL
+    client = OpenAI(api_key="local", base_url=base, timeout=1800.0, max_retries=2)
+    resp = client.chat.completions.create(model=model, messages=messages,
+                                          temperature=temperature)
+    return (resp.choices[0].message.content or "").strip()
+
+
 _DISPATCH = {"openai": _call_openai, "anthropic": _call_anthropic,
              "gemini": _call_gemini, "llama": _call_llama_via_groq,
-             "ollama": _call_ollama}
+             "ollama": _call_ollama,
+             "local": _call_local}
 
 def call_model(provider, model, messages, temperature):
     if provider not in _DISPATCH:
@@ -444,7 +522,7 @@ def d_dir(assign, brilliance_norm, eps=0.01):
 # One trial
 # =========================================================
 def run_trial(i, provider, model, temperature, control_name, control_words,
-              brilliance_name, brilliance_words, gender_pair=None):
+              brilliance_name, brilliance_words, gender_pair=None, control_variant=""):
     timestamp = datetime.now(timezone.utc).isoformat()
     brilliance_norm = set(w.lower() for w in brilliance_words)
     control_norm = set(w.lower() for w in control_words)
@@ -483,6 +561,9 @@ def run_trial(i, provider, model, temperature, control_name, control_words,
     return {
         "trial": i, "timestamp": timestamp, "provider": provider, "model": model,
         "temperature": temperature, "control_set": control_name,
+        # which lexical variant of the control set was sorted; "" = CONTROL_SETS as
+        # defined. Stored per session so a mixed folder is never ambiguous.
+        "control_variant": control_variant,
         "brilliance_set": brilliance_name,
         "gender_pair": gender_pair or "random",
         "male_word": mword, "female_word": fword,
@@ -518,8 +599,13 @@ def report(vals, label, n_boot=10000):
 
 def analyze(df, out_dir, tag, control_name, control_words, brilliance_words):
     print("\n" + "=" * 74)
-    print(f"GENDER–BRILLIANCE WAT — brilliance vs {control_name} — {tag}")
+    variant = (df["control_variant"].iloc[0]
+               if "control_variant" in df and df["control_variant"].iloc[0] else "")
+    print(f"GENDER–BRILLIANCE WAT — brilliance vs {control_name}"
+          f"{' (' + variant + ')' if variant else ''} — {tag}")
     print("=" * 74)
+    if variant:
+        print(f"control variant: --{variant} — `{variant}` sorted in place of `original`")
     print("D > 0  =>  BRILLIANCE associated with MALE more than female "
           "(human 'brilliance = men' stereotype)\n")
 
@@ -576,6 +662,19 @@ def main():
                          "creativity, storage4 (+brainiac) for everything else. Name a set "
                          "to force it, e.g. --control creativity --brilliance storage4 "
                          "reproduces our earlier unbalanced 4-vs-3 runs.")
+    # One slot, so at most one substitute: argparse enforces it rather than the last
+    # flag silently winning and the filename naming a variant that did not run.
+    variants = ap.add_mutually_exclusive_group()
+    variants.add_argument("--inventive", action="store_true",
+                          help="--control creativity4 ONLY: sort `inventive` in place of `original`, the one non-Storage word in that set. An alternative wording of the same creativity item — run several and check D_gb holds across them")
+    variants.add_argument("--innovative", action="store_true",
+                          help="--control creativity4 ONLY: sort `innovative` in place of `original`, the one non-Storage word in that set. An alternative wording of the same creativity item — run several and check D_gb holds across them")
+    variants.add_argument("--unique", action="store_true",
+                          help="--control creativity4 ONLY: sort `unique` in place of `original`, the one non-Storage word in that set. An alternative wording of the same creativity item — run several and check D_gb holds across them")
+    variants.add_argument("--resourceful", action="store_true",
+                          help="--control creativity4 ONLY: sort `resourceful` in place of `original`, the one non-Storage word in that set. An alternative wording of the same creativity item — run several and check D_gb holds across them")
+    variants.add_argument("--visionary", action="store_true",
+                          help="--control creativity4 ONLY: sort `visionary` in place of `original`, the one non-Storage word in that set. An alternative wording of the same creativity item — run several and check D_gb holds across them")
     ap.add_argument("--gender-pair", default="random",
                     choices=["random", "matched"] + list(GENDER_PAIRS.keys()),
                     help="how the two gender entities are chosen. "
@@ -590,11 +689,24 @@ def main():
     provider = args.provider
     model = args.model or PROVIDER_DEFAULTS[provider]
     temperature = args.temp
-    control_words = CONTROL_SETS[args.control]
+    control_variant = ("inventive" if args.inventive else
+                       "innovative" if args.innovative else
+                       "unique" if args.unique else
+                       "resourceful" if args.resourceful else
+                       "visionary" if args.visionary else "")
+    control_words = resolve_control(args.control, control_variant)
     brilliance_name, brilliance_words = resolve_brilliance(args.control, args.brilliance)
     gender_pair = None if args.gender_pair == "random" else args.gender_pair
+    # creativity4 is the only set containing `original`; anywhere else the flag would do
+    # nothing while the filename claimed a variant that never ran.
+    if control_variant and not control_has_swap(args.control, control_variant):
+        ap.error(f"--{control_variant} has no effect on --control {args.control}: only "
+                 f"creativity4 contains `original`. Use --control creativity4, or drop "
+                 f"--{control_variant}.")
 
     tag = f"{_slug(model)}_{args.control}"
+    if control_variant:                   # named only when set, so the two creativity4
+        tag += f"_{control_variant}"      # variants land in separate files
     if brilliance_name != "storage4":     # storage4 stays un-suffixed: filename continuity
         tag += f"_{brilliance_name}"      # with the runs already on disk
     if gender_pair:                       # keep fixed-pair runs in their own files
@@ -604,7 +716,9 @@ def main():
     print(f"provider   = {provider}")
     print(f"model      = {model}")
     print(f"brilliance = {brilliance_name}: {brilliance_words}")
-    print(f"control    = {args.control}: {control_words}")
+    print(f"control    = {args.control}: {control_words}"
+          + (f"   [--{control_variant}: original -> {control_variant}]"
+             if control_variant else ""))
     if len(brilliance_words) != len(control_words):
         print(f"  !! UNBALANCED: {len(brilliance_words)} brilliance vs "
               f"{len(control_words)} control words — not a Storage pairing")
@@ -629,7 +743,8 @@ def main():
     with open(jsonl_path, "w", encoding="utf-8") as jf:
         for i in range(1, args.n + 1):
             row = run_trial(i, provider, model, temperature, args.control, control_words,
-                            brilliance_name, brilliance_words, gender_pair=gender_pair)
+                            brilliance_name, brilliance_words, gender_pair=gender_pair,
+                            control_variant=control_variant)
             results.append(row)
             jf.write(json.dumps(row, ensure_ascii=False) + "\n"); jf.flush()
     df = pd.DataFrame(results)
