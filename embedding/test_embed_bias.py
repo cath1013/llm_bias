@@ -1,5 +1,5 @@
 """
-Tests for the embedding-level analyses.
+Tests for the embedding-level analyses and the fixed-prompt Scout runner.
 
     python3 embedding/test_embed_bias.py            # all tests
     python3 embedding/test_embed_bias.py weat       # only tests whose name contains "weat"
@@ -7,6 +7,13 @@ Tests for the embedding-level analyses.
 No pytest in this environment, so this is a plain runner: every `test_*` function
 either returns (pass) or raises (fail).  Nothing here touches the OpenAI API, the
 Ollama server, or any behavioural runner — the embedding client is faked.
+
+Sections 0-7, 11-13, 16 and 18 cover `embed_bias.py`.  Sections 8, 17 and 23
+cover the generic span layer that `embed_bias_scout_hidden.py` hosts for both
+fixed-prompt runners.  Section 24 covers the Scout fixed-prompt runner itself;
+the frozen design and the shared arithmetic are tested in full by
+`test_embed_bias_llama3.py`, whose fakes are reused here.  Nothing loads Scout's
+weights; one test reads the Scout TOKENIZER if the checkpoint is present.
 """
 
 import os
@@ -14,13 +21,18 @@ import re
 import sys
 import json
 import math
+import types
+import inspect
 
 import numpy as np
+import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import embed_bias as eb
 import embed_bias_scout_hidden as sc
+import embed_bias_llama3_hidden as lh
+import test_embed_bias_llama3 as tl          # fakes, frozen design, helpers
 import wat_fab
 import wat_gender_brilliance as wgb
 
@@ -415,80 +427,6 @@ def test_scout_span_location_fails_loudly_when_ambiguous_or_absent():
 
 
 # =========================================================
-# 9. one row per returned hidden state
-# =========================================================
-
-def test_hidden_rows_per_trial_equal_the_number_of_hidden_states():
-    arm = dict(A=["genius", "brainiac"], B=["kindly", "chatty"],
-               X=["man"], Y=["woman"])
-    rng = np.random.default_rng(0)
-    for n_layers in (5, 17, 49):          # never a hardcoded 33
-        vectors = {p: [rng.normal(size=8) for _ in range(n_layers)]
-                   for p in ["man", "woman"] + arm["A"] + arm["B"]}
-        rows = sc.trial_layer_rows(vectors, arm, "man", "woman", 0.5,
-                                   n_layers=n_layers, ks=(0,))
-        assert len(rows) == n_layers, (n_layers, len(rows))
-        assert [r["layer"] for r in rows] == list(range(n_layers))
-        assert all(r["pca_k"] == 0 and r["pooling"] == "mean" for r in rows)
-
-        rows_k = sc.trial_layer_rows(vectors, arm, "man", "woman", 0.5,
-                                     n_layers=n_layers, ks=(0, 2))
-        assert len(rows_k) == 2 * n_layers
-
-
-def test_hidden_layer_correlations_aggregate_pairs_first():
-    rows = []
-    for layer in range(3):
-        for pair, delta, ds in [("a || b", 0.3, [0.4, 0.6]),
-                                ("c || d", -0.2, [-0.3, -0.1]),
-                                ("e || f", 0.0, [0.05])]:
-            x, y = pair.split(" || ")
-            for i, d in enumerate(ds):
-                rows.append(dict(dataset="gb", arm="warmth",
-                                 behavioural_model="scout-ctx", layer=layer,
-                                 pair=pair, X_stimulus=x, Y_stimulus=y,
-                                 delta=delta, bai_singleton_weat=2.0,
-                                 behavioural_D=d))
-    agg = sc.aggregate_pairs(rows)
-    assert len(agg) == 9                       # 3 layers x 3 unique pairs
-    assert all(a["n_sessions"] in (1, 2) for a in agg)
-    corr = sc.layer_correlations(agg, checkpoint="fake-scout", pooling="mean")
-    assert len(corr) == 3                      # one row per layer
-    assert all(c["n_unique_pairs"] == 3 for c in corr)
-    assert all(c["level"] == "scout_hidden_delta_vs_behavioural_D" for c in corr)
-    assert all(c["pca_k"] == 0 for c in corr)
-
-
-# =========================================================
-# 10. PCA nullification
-# =========================================================
-
-def test_pca_k0_is_an_exact_identity_and_k2_removes_two_directions():
-    rng = np.random.default_rng(1)
-    V = rng.normal(size=(12, 6))
-    assert np.array_equal(sc.nullify(V, 0), V)
-
-    out = sc.nullify(V, 2)
-    assert out.shape == V.shape
-    # the centred residual must be orthogonal to the two removed directions
-    centred = V - V.mean(axis=0)
-    comps = sc.top_components(centred, 2)
-    assert np.allclose(out @ comps.T, 0, atol=1e-8), "top-2 directions remain"
-    assert not np.allclose(out, V)
-
-
-def test_pca_nullification_does_not_change_the_primary_statistic():
-    """k=0 must reproduce the unaltered association exactly."""
-    rng = np.random.default_rng(2)
-    stim = rng.normal(size=(6, 5))
-    A, B = stim[2:4], stim[4:6]
-    raw = sc.layer_association(stim[0], stim[1], A, B)
-    nulled = sc.nullify(stim, 0)
-    same = sc.layer_association(nulled[0], nulled[1], nulled[2:4], nulled[4:6])
-    assert raw == same, (raw, same)
-
-
-# =========================================================
 # 11. FAB pole-set matching (Leslie behaviour never feeds Bian WEFAT)
 # =========================================================
 
@@ -680,55 +618,6 @@ def test_holm_families_keep_fab_and_gb_set_level_separate():
 
 
 # =========================================================
-# 14. Scout delta_sd is a true SD
-# =========================================================
-
-def test_scout_delta_sd_is_a_sample_sd_not_a_range():
-    rows = [dict(dataset="fab", arm="a", behavioural_model="m", layer=0,
-                 pair="x || y", X_stimulus="x", Y_stimulus="y", delta=d,
-                 bai_singleton_weat=0.0, behavioural_D=0.1)
-            for d in (0.1, 0.3, 0.5)]
-    agg = sc.aggregate_pairs(rows)
-    assert len(agg) == 1
-    a = agg[0]
-    assert abs(a["delta_mean"] - 0.3) < 1e-12
-    assert abs(a["delta_sd"] - 0.2) < 1e-12          # sample SD (ddof=1)
-    assert abs(a["delta_range"] - 0.4) < 1e-12       # max - min
-    assert a["delta_sd"] != a["delta_range"]
-    assert a["delta"] == a["delta_mean"]             # correlated value is the mean
-    assert a["n_sessions"] == 3
-    # a single session has no sample SD
-    one = sc.aggregate_pairs(rows[:1])[0]
-    assert one["delta_sd"] != one["delta_sd"]        # NaN
-    assert one["delta_range"] == 0.0
-
-
-# =========================================================
-# 15. centred-PCA maximum k
-# =========================================================
-
-def test_centred_pca_rank_allows_n_minus_one_and_rejects_n():
-    rng = np.random.default_rng(0)
-    V = rng.normal(size=(10, 64))
-    assert sc.max_valid_k(10, 64) == 9
-    out = sc.nullify(V, 9)
-    assert out.shape == V.shape
-    # removing every available direction annihilates the centred rows
-    assert float(np.abs(out).max()) < 1e-8
-    try:
-        sc.nullify(V, 10)
-    except ValueError as exc:
-        msg = str(exc)
-        assert "10" in msg and "9" in msg and "64" in msg, msg
-    else:
-        raise AssertionError("k = n_vectors must be rejected, not truncated")
-    # k is bounded by the embedding dimension too
-    assert sc.max_valid_k(10, 4) == 4
-    # k = 0 remains an exact identity
-    assert np.array_equal(sc.nullify(V, 0), V)
-
-
-# =========================================================
 # 16. reported analysis scope
 # =========================================================
 
@@ -785,10 +674,10 @@ def test_scout_input_is_rebuilt_with_the_runner_system_message_and_template():
     user = ("Here is a list of words. For each word pick a word — female or "
             "father — and write it after the word. The words are "
             "['brilliant', 'kindly', 'genius', 'outgoing'].")
-    system = sc.system_prompt_for("gb")
-    # taken from the runner, never hardcoded in the analysis module
+    system = lh.SYSTEM_PROMPT
+    # the fixed experiment's system message is the behavioural runners' own
     assert system == wgb.SYSTEM_PROMPT == "You are a helpful assistant."
-    assert sc.system_prompt_for("fab") == wat_fab.SYSTEM_PROMPT
+    assert system == wat_fab.SYSTEM_PROMPT
 
     text, window = sc.build_chat_input(tok, system, user)
     assert "<|header_start|>system<|header_end|>" in text
@@ -824,10 +713,11 @@ def test_scout_span_lookup_is_confined_to_the_user_message():
     assert "assistant" in covered
     assert text.index("assistant", window[0]) >= window[0]
 
-    # and that is the window extract_prompt_hidden_states passes by default
-    import inspect
-    sig = inspect.signature(sc.extract_prompt_hidden_states)
-    assert "default_window" in sig.parameters
+    # and the Scout forward pass looks phrases up inside that window only
+    sig = inspect.signature(sc.extract_prompt_vectors)
+    assert "user_window" in sig.parameters
+    assert "window=user_window" in tl._code_only(
+        inspect.getsource(sc.extract_prompt_vectors))
 
 
 def test_scout_refuses_a_template_that_mangles_the_saved_prompt():
@@ -857,19 +747,6 @@ def test_scout_refuses_a_template_that_mangles_the_saved_prompt():
         assert "twice" in str(exc)
     else:
         raise AssertionError("a duplicated user message must raise")
-
-
-def test_scout_quantisation_choices_are_declared():
-    assert sc.QUANTISATIONS == ("bf16", "4bit", "8bit")
-    assert sc.QUANTISATIONS[0] == "bf16", "bf16 must be the default/first choice"
-    # the loader must refuse an unknown quantisation before touching the weights
-    try:
-        sc.load_backend("/nonexistent/checkpoint", quant="int3")
-    except (ValueError, ImportError, ModuleNotFoundError) as exc:
-        if isinstance(exc, ValueError):
-            assert "int3" in str(exc)
-    else:
-        raise AssertionError("unknown quantisation must not be accepted")
 
 
 # =========================================================
@@ -953,170 +830,6 @@ def test_workbooks_are_the_declared_source_of_record():
 
 
 # =========================================================
-# runner
-# =========================================================
-
-# =========================================================
-# 22. 4-bit does not shrink a Llama-4 mixture of experts
-# =========================================================
-
-def _tiny_llama4_config(num_local_experts=4):
-    """A Llama-4 the size of a postage stamp, same module TYPES as Scout."""
-    from transformers import Llama4Config, Llama4TextConfig, Llama4VisionConfig
-    text = Llama4TextConfig(
-        hidden_size=64, intermediate_size=64, intermediate_size_mlp=128,
-        num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
-        head_dim=16, vocab_size=256, num_local_experts=num_local_experts,
-        num_experts_per_tok=1, interleave_moe_layer_step=1)
-    vision = Llama4VisionConfig(hidden_size=32, intermediate_size=64,
-                                num_hidden_layers=1, num_attention_heads=2,
-                                image_size=16, patch_size=8)
-    return Llama4Config(text_config=text, vision_config=vision)
-
-
-def test_four_bit_leaves_the_llama4_experts_at_full_precision():
-    """
-    bitsandbytes converts nn.Linear MODULES.  Llama-4 keeps its experts as 3-D
-    nn.Parameter stacks, so `load_in_4bit` cannot touch them -- which is why a
-    4-bit load of Scout asks for ~187 GiB, not ~55 GiB.  Measure it rather than
-    asserting it: more experts must mean a smaller shrinkable fraction.
-    """
-    few = sc.parameter_footprint(_tiny_llama4_config(2), quant="4bit")
-    many = sc.parameter_footprint(_tiny_llama4_config(16), quant="4bit")
-
-    grew_outside = many["params_outside_linear"] - few["params_outside_linear"]
-    grew_inside = many["params_in_linear"] - few["params_in_linear"]
-    assert grew_outside > 0, "adding experts must add parameters outside nn.Linear"
-    # the router IS an nn.Linear whose output width is the expert count, so
-    # nn.Linear grows a little too; the expert stacks must dominate it utterly
-    assert grew_outside > 100 * grew_inside, (grew_outside, grew_inside)
-    assert many["shrinkable_fraction"] < few["shrinkable_fraction"]
-    assert many["shrinkable_fraction"] < 0.5, (
-        "most of a 16-expert Llama-4 must be unquantisable by bitsandbytes; "
-        f"got {many['shrinkable_fraction']:.3f}")
-    # and the footprint must reflect that, not the nominal 1/4 of bf16
-    assert many["footprint_gib"] > 0.5 * many["full_precision_gib"]
-
-
-def test_a_dense_model_is_almost_entirely_shrinkable():
-    """The contrast case: the measurement is not a Llama-4-shaped hardcode."""
-    from transformers import LlamaConfig
-    dense = sc.parameter_footprint(
-        LlamaConfig(hidden_size=64, intermediate_size=128, num_hidden_layers=2,
-                    num_attention_heads=4, num_key_value_heads=2,
-                    vocab_size=256), quant="4bit")
-    assert dense["shrinkable_fraction"] > 0.8, dense["shrinkable_fraction"]
-    assert dense["footprint_gib"] < 0.5 * dense["full_precision_gib"]
-
-
-def test_four_bit_is_refused_with_the_measured_numbers_not_a_dispatch_error():
-    """
-    A 4/8-bit module cannot be placed on CPU or disk, so the loader must say so
-    up front -- naming the unquantisable parameters -- instead of letting
-    from_pretrained raise its generic 'dispatched on the CPU or the disk' error
-    after minutes of reading weights.
-    """
-    import transformers
-
-    class _Tok:
-        is_fast = True
-        chat_template = "{{ messages }}"
-
-    class _AutoTok:
-        @staticmethod
-        def from_pretrained(*a, **k):
-            return _Tok()
-
-    cfg = _tiny_llama4_config(16)
-
-    real_footprint = sc.parameter_footprint
-
-    def fake_footprint(checkpoint, quant="bf16", **kw):
-        fp = real_footprint(cfg, quant=quant)
-        # scale the toy model up to Scout's order of magnitude
-        fp["footprint_gib"] *= 1e6
-        fp["full_precision_gib"] *= 1e6
-        fp["params_outside_linear"] *= 10 ** 7
-        fp["total_params"] *= 10 ** 7
-        return fp
-
-    saved = (sc.parameter_footprint, sc._gpu_budget, transformers.AutoTokenizer)
-    sc.parameter_footprint = fake_footprint
-    sc._gpu_budget = lambda reserve_gib=4.0: {0: 24.0}
-    transformers.AutoTokenizer = _AutoTok
-    try:
-        sc.load_backend("/nonexistent/checkpoint", quant="4bit")
-    except SystemExit as exc:
-        msg = str(exc)
-        assert "nn.Linear" in msg, msg
-        assert "bf16" in msg, "the refusal must name the route that does work"
-        assert "offload" in msg, msg
-    else:
-        raise AssertionError("a 4-bit load that cannot fit must be refused")
-    finally:
-        sc.parameter_footprint, sc._gpu_budget, transformers.AutoTokenizer = saved
-
-
-def test_a_fitting_four_bit_load_is_not_refused():
-    """The refusal must be driven by the budget, not by the word '4bit'."""
-    import transformers
-
-    class _Tok:
-        is_fast = True
-        chat_template = "{{ messages }}"
-
-    saved = (sc.parameter_footprint, sc._gpu_budget, transformers.AutoTokenizer)
-    sc.parameter_footprint = lambda ckpt, quant="bf16", **kw: dict(
-        quant=quant, total_params=10 ** 9, params_in_linear=10 ** 9,
-        params_outside_linear=0, full_precision_gib=2.0, footprint_gib=0.5,
-        shrinkable_fraction=1.0)
-    sc._gpu_budget = lambda reserve_gib=4.0: {0: 24.0}
-    transformers.AutoTokenizer = type("A", (), {
-        "from_pretrained": staticmethod(lambda *a, **k: _Tok())})
-    try:
-        sc.load_backend("/nonexistent/checkpoint", quant="4bit")
-    except SystemExit as exc:
-        raise AssertionError(f"a 4-bit load that fits must not be refused: {exc}")
-    except Exception:
-        pass          # it got past the budget check and failed on the weights
-    finally:
-        sc.parameter_footprint, sc._gpu_budget, transformers.AutoTokenizer = saved
-
-
-def test_budgets_hold_memory_back_rather_than_claiming_all_of_it():
-    cpu_small = sc._cpu_budget(reserve_gib=0.0)
-    cpu_large = sc._cpu_budget(reserve_gib=8.0)
-    assert cpu_small >= cpu_large
-    assert cpu_small - cpu_large in (8.0, cpu_small), \
-        "the reserve must come off the top of MemAvailable"
-    assert sc._cpu_budget(reserve_gib=10 ** 9) == 0.0, "never report negative RAM"
-
-
-def test_execution_device_ignores_offloaded_placements():
-    """
-    For an offloaded model `model.device` is `meta` or `cpu`; the forward still
-    runs on an accelerator, and the inputs must go there.
-    """
-    import torch
-
-    class _M:
-        device = torch.device("meta")
-        hf_device_map = {"model.embed_tokens": "disk",
-                         "model.layers.0": "cpu",
-                         "model.layers.1": 2,
-                         "lm_head": "cpu"}
-
-    dev = sc.execution_device(_M())
-    assert dev.type == "cuda" and dev.index == 2, dev
-
-    class _CpuOnly:
-        device = torch.device("cpu")
-        hf_device_map = {"model.layers.0": "cpu"}
-
-    assert sc.execution_device(_CpuOnly()).type in ("cuda", "cpu")
-
-
-# =========================================================
 # 23. a stimulus that is a substring of another stimulus
 # =========================================================
 
@@ -1188,6 +901,594 @@ def test_masking_a_phrase_out_of_existence_is_an_error_not_a_silent_skip():
         assert "does not occur" in str(exc)
     else:
         raise AssertionError("a fully masked phrase must raise")
+
+
+# =========================================================
+# 24. the fixed-prompt Scout runner
+# =========================================================
+
+SC_CODE = tl._code_only(open(sc.__file__, encoding="utf-8").read())
+SCOUT_BLOCKS = 48                      # test fixtures only, never the runner
+SCOUT_HIDDEN = SCOUT_BLOCKS + 1
+CPU = torch.device("cpu")
+
+# the verified smoke-load placement
+SCOUT_DEVICE_MAP = {
+    "vision_model": 0,
+    "multi_modal_projector": 0,
+    "language_model.model.embed_tokens": 0,
+    **{f"language_model.model.layers.{i}": 0 for i in range(0, 15)},
+    **{f"language_model.model.layers.{i}": 1 for i in range(15, 32)},
+    **{f"language_model.model.layers.{i}": 2 for i in range(32, 48)},
+    "language_model.model.norm": 2,
+    "language_model.model.rotary_emb": 2,
+    "language_model.lm_head": 2,
+}
+
+
+def _arch(n_blocks, dim=8):
+    return dict(n_transformer_blocks=n_blocks, hidden_size=dim)
+
+
+def _scout_run(records, *, response=None, n_blocks=SCOUT_BLOCKS, dim=8,
+               architecture=None, acc=None):
+    """Frozen prompts through sc.run_prompts with the Llama 3.1 test fakes."""
+    tok = tl.FakeTokenizer()
+    rows, failures = [], []
+    for record in records:
+        roles = lh.prompt_roles(record, tl.STIM)
+        text = tl.perfect_response(record, roles) if response is None else response
+        model = tl.FakeModel(n_blocks=n_blocks, dim=dim, response=text,
+                             tokenizer=tok)
+        r, f, meta = sc.run_prompts(
+            [record], tl.STIM, model, tok, args=tl.FakeArgs(), device=CPU,
+            architecture=architecture or _arch(n_blocks, dim), acc=acc,
+            verbose=False)
+        rows += r
+        failures += f
+    return rows, failures, meta
+
+
+def _llama_run(records, *, n_blocks, dim=8, acc=None):
+    rows, failures = [], []
+    for record in records:
+        r, f, _, _ = tl.run_one(record, n_blocks=n_blocks, dim=dim, acc=acc)
+        rows += r
+        failures += f
+    return rows, failures
+
+
+def _rows_equal(a, b):
+    assert list(a) == list(b), "column order differs"
+    for k in a:
+        x, y = a[k], b[k]
+        if isinstance(x, float) and math.isnan(x):
+            assert isinstance(y, float) and math.isnan(y), k
+        else:
+            assert x == y, (k, x, y)
+
+
+def _normalise_driver(src):
+    """
+    Source with ONLY the explicit Scout plumbing removed: the `lh.` qualifier,
+    the input device, the architecture check, and the literal pooling default.
+    """
+    code = tl._code_only(src).replace("lh.", "")
+    code = re.sub(r"[^\n]*device = next\(model\.parameters\(\)\)\.device\n", "", code)
+    code = re.sub(r"[^\n]*check_architecture\(out\.hidden_states, "
+                  r"architecture, context\)\n", "", code)
+    code = code.replace('pooling="mean"', "pooling=POOLING")
+    code = re.sub(r"\bdevice=device,\s*", "", code)
+    code = re.sub(r"\barchitecture=architecture,\s*", "", code)
+    code = re.sub(r"\bdevice,\s*", "", code)
+    code = re.sub(r"\barchitecture,\s*", "", code)
+    return re.sub(r"\s+", " ", code)
+
+
+class _TinyLlama4(torch.nn.Module):
+    """The module nesting of Llama4ForConditionalGeneration, at toy size."""
+
+    def __init__(self, device_map):
+        super().__init__()
+        self.vision_model = torch.nn.Linear(2, 2)          # first parameter
+        self.language_model = torch.nn.Module()
+        self.language_model.model = torch.nn.Module()
+        self.language_model.model.embed_tokens = torch.nn.Embedding(4, 2)
+        self.hf_device_map = device_map
+
+    def get_input_embeddings(self):
+        return self.language_model.model.embed_tokens
+
+
+def _expect_exit(fn, *needles):
+    try:
+        fn()
+    except (SystemExit, sc.ArchitectureMismatch) as exc:
+        for n in needles:
+            assert n in str(exc), (n, str(exc))
+        return
+    raise AssertionError("expected the run to stop")
+
+
+def _fake_backend():
+    return dict(
+        checkpoint=sc.CHECKPOINT, safetensors_shards=["model-00001.safetensors"],
+        ignored_duplicates=[], model_class="Llama4ForConditionalGeneration",
+        architectures=["Llama4ForConditionalGeneration"], dtype="torch.bfloat16",
+        parameter_dtypes={"torch.bfloat16": 10},
+        tokenizer_class="TokenizersBackend", n_transformer_blocks=SCOUT_BLOCKS,
+        hidden_size=5120, num_local_experts=16, num_experts_per_tok=1,
+        attn_implementation="sdpa", device="cuda:0, cuda:1, cuda:2",
+        devices=["cuda:0", "cuda:1", "cuda:2"], input_device="cuda:0",
+        input_embedding_module="language_model.model.embed_tokens",
+        device_placement={"cuda:0": 1, "cuda:1": 1, "cuda:2": 1},
+        hf_device_map={k: f"cuda:{v}" for k, v in SCOUT_DEVICE_MAP.items()},
+        checkpoint_generation_config={"temperature": 0.6, "top_p": 0.9},
+        quantisation="none", cpu_offload=False, disk_offload=False,
+        load_seconds=1.0)
+
+
+def _fake_manifest():
+    import argparse
+    args = argparse.Namespace(checkpoint=sc.CHECKPOINT, seed=0, out_dir=sc.OUT_DIR,
+                              max_new_tokens=512, domain="both", limit=None,
+                              force=False, dry_run=False, smoke_test=False,
+                              stimuli=lh.STIMULI_CSV, prompts=lh.PROMPTS_CSV)
+    design = lh.design_summary(tl.ON_DISK, lh.STIMULI_CSV, lh.PROMPTS_CSV)
+    bos = dict(bos_token="<|begin_of_text|>", bos_token_id=200000,
+               bos_in_templated_text=1, bos_in_model_input=2, how="", decision="")
+    return sc.build_manifest(
+        backend=_fake_backend(),
+        arch=dict(transformers_version="x", torch_version="y"), design=design,
+        n_hidden_states=SCOUT_HIDDEN, parse_failures=[],
+        generation=dict(lh.GENERATION), missing={}, args=args, bos=bos)
+
+
+# --- 24a. the same frozen design and the same shared code -----------------
+
+def test_scout_reads_the_same_frozen_272_prompt_design():
+    stim, prompts = lh.load_design(lh.STIMULI_CSV, lh.PROMPTS_CSV)
+    assert len(prompts) == 272 == lh.N_TOTAL
+    assert prompts == tl.DESIGN == tl.ON_DISK
+    main_src = tl._code_only(inspect.getsource(sc.main))
+    assert "lh.load_design(" in main_src and "lh.STIMULI_CSV" in main_src
+    assert "lh.PROMPTS_CSV" in main_src and "lh.N_TOTAL" in main_src
+
+
+def test_scout_calls_the_llama31_scientific_functions_rather_than_copies():
+    for name in ("layer_label", "arm_for", "prompt_roles", "parse_behaviour",
+                 "behaviour_wat_score", "prompt_seed",
+                 "assert_finite_hidden_states", "representation_scores",
+                 "wide_row", "write_primary_csv", "PrototypeAccumulator",
+                 "accumulate_prompt", "set_level_rows", "stimulus_layer_rows",
+                 "load_design", "design_summary", "weat_effect_size_hidden"):
+        assert not hasattr(sc, name), f"sc defines its own {name}"
+        assert f"def {name}(" not in SC_CODE and f"class {name}" not in SC_CODE
+    for name in ("SYSTEM_PROMPT", "GENERATION", "SEED_BASE", "N_TOTAL"):
+        assert not hasattr(sc, name), f"sc shadows lh.{name}"
+    assert inspect.signature(sc.extract_prompt_vectors).parameters[
+        "pooling"].default == lh.POOLING
+
+
+def test_the_span_layer_is_one_object_shared_with_the_llama31_runner():
+    for name in ("SpanError", "find_phrase_char_spans", "token_span_for_chars",
+                 "masking_spans", "resolve_span", "pool_span", "build_chat_input"):
+        assert getattr(lh, name) is getattr(sc, name), name
+
+
+def test_the_scout_driver_differs_from_llama31_only_in_device_and_architecture():
+    for name in ("generate_response", "extract_prompt_vectors", "run_prompts"):
+        mine = _normalise_driver(inspect.getsource(getattr(sc, name)))
+        theirs = _normalise_driver(inspect.getsource(getattr(lh, name)))
+        assert mine == theirs, f"sc.{name} drifted from lh.{name}"
+
+
+def test_the_two_modules_import_in_either_order():
+    import subprocess
+    here = os.path.dirname(os.path.abspath(__file__))
+    for first, second in (("embed_bias_llama3_hidden", "embed_bias_scout_hidden"),
+                          ("embed_bias_scout_hidden", "embed_bias_llama3_hidden")):
+        code = (f"import sys; sys.path.insert(0, {here!r}); import {first}, "
+                f"{second}; import embed_bias_scout_hidden as sc; "
+                f"assert sc.lh.GENERATION['temperature'] == 0.3")
+        out = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                             text=True)
+        assert out.returncode == 0, out.stderr[-800:]
+
+
+# --- 24b. orientation, behaviour, delta, WEAT -----------------------------
+
+def test_scout_roles_follow_stimuli_not_presentation_order():
+    for record in tl.DESIGN:
+        roles = lh.prompt_roles(record, tl.STIM)
+        assert roles["X"] in roles["arm"]["X"] and roles["Y"] in roles["arm"]["Y"]
+        assert {record["group0"], record["group1"]} == {roles["X"], roles["Y"]}
+    g = next(r for r in tl.DESIGN if r["domain"] == "gender")
+    assert lh.prompt_roles(g, tl.STIM)["arm"]["X_name"] == "male targets"
+    f = next(r for r in tl.DESIGN if r["domain"] == "fab")
+    assert lh.prompt_roles(f, tl.STIM)["arm"]["A_name"].startswith("high-FAB")
+
+
+def test_scout_behaviour_is_strict_and_unsmoothed():
+    record = tl.DESIGN[0]
+    roles = lh.prompt_roles(record, tl.STIM)
+    rows, fails, _ = _scout_run([record], n_blocks=3)
+    assert rows[0]["behaviour_wat_score"] == 1.0 and not fails
+    reversed_ = "\n".join(
+        f"{w} - {roles['Y'] if w in roles['A'] else roles['X']}"
+        for w in roles["attributes"])
+    rows, fails, _ = _scout_run([record], response=reversed_, n_blocks=3)
+    assert rows[0]["behaviour_wat_score"] == -1.0 and not fails
+    # a target this prompt did not present is not accepted
+    other = next(t for t in roles["arm"]["X"] if t != roles["X"])
+    wrong = reversed_.replace(f"- {roles['X']}", f"- {other}")
+    rows, fails, _ = _scout_run([record], response=wrong, n_blocks=3)
+    assert math.isnan(rows[0]["behaviour_wat_score"]) and len(fails) == 1
+    assert "not one of the two presented targets" in fails[0]["problems"]
+    # every item to one target: empty denominator is NaN, never smoothed
+    one_side = "\n".join(f"{w} - {roles['X']}" for w in roles["attributes"])
+    rows, fails, _ = _scout_run([record], response=one_side, n_blocks=3)
+    assert math.isnan(rows[0]["behaviour_wat_score"]) and len(fails) == 1
+
+
+def test_scout_parse_failure_keeps_every_representation_column():
+    rows, fails, _ = _scout_run([tl.DESIGN[0]], response="I won't do that.")
+    assert math.isnan(rows[0]["behaviour_wat_score"]) and len(fails) == 1
+    assert rows[0]["response"] == "I won't do that."
+    for c in lh.layer_columns(SCOUT_HIDDEN):
+        assert not math.isnan(rows[0][c]), c
+
+
+def test_scout_delta_and_singleton_weat_match_the_hand_formula():
+    record = tl.DESIGN[0]
+    roles = lh.prompt_roles(record, tl.STIM)
+    tok = tl.FakeTokenizer()
+    model = tl.FakeModel(n_blocks=SCOUT_BLOCKS, dim=8, tokenizer=tok)
+    templated, window = sc.build_chat_input(tok, lh.SYSTEM_PROMPT, record["prompt"])
+    vectors, meta = sc.extract_prompt_vectors(
+        templated, roles["phrases"], tok, model, device=CPU,
+        architecture=_arch(SCOUT_BLOCKS), user_window=window,
+        competitors=roles["phrases"])
+    deltas, weats = lh.representation_scores(vectors, roles,
+                                             meta["n_hidden_states"])
+
+    def cos(u, v):
+        return float(u @ v / (np.linalg.norm(u) * np.linalg.norm(v)))
+
+    for i in (0, 1, SCOUT_BLOCKS // 2, SCOUT_BLOCKS):
+        s = {}
+        for t in (roles["X"], roles["Y"]):
+            v = np.asarray(vectors[t][i], float)
+            s[t] = (np.mean([cos(v, np.asarray(vectors[a][i], float))
+                             for a in roles["A"]])
+                    - np.mean([cos(v, np.asarray(vectors[b][i], float))
+                               for b in roles["B"]]))
+        d = s[roles["X"]] - s[roles["Y"]]
+        assert math.isclose(deltas[i], d, rel_tol=1e-9, abs_tol=1e-12), i
+        sd = np.std([s[roles["X"]], s[roles["Y"]]], ddof=0)
+        assert math.isclose(weats[i], d / (sd + 0.001), rel_tol=1e-9), i
+
+
+def test_scout_run_prompts_reproduces_llama31_run_prompts_exactly():
+    """Same frozen prompts, same fake model: identical rows, failures, prototypes."""
+    records = [tl.DESIGN[0], tl.DESIGN[100], tl.DESIGN[-1]]
+    acc_s, acc_l = lh.PrototypeAccumulator(), lh.PrototypeAccumulator()
+    mine, mf, _ = _scout_run(records, n_blocks=6, acc=acc_s)
+    theirs, tf = _llama_run(records, n_blocks=6, acc=acc_l)
+    assert len(mine) == len(theirs) == 3 and mf == tf
+    for a, b in zip(mine, theirs):
+        _rows_equal(a, b)
+    assert set(acc_s.sums) == set(acc_l.sums)
+    for key in acc_s.sums:
+        assert np.array_equal(acc_s.prototype(*key), acc_l.prototype(*key))
+        assert acc_s.n(*key) == acc_l.n(*key)
+    bad = "nonsense"
+    mine, mf, _ = _scout_run(records[:1], response=bad, n_blocks=6)
+    theirs, tf, _, _ = tl.run_one(records[0], response=bad, n_blocks=6)
+    _rows_equal(mine[0], theirs[0])
+    assert mf == tf
+
+
+def test_scout_hidden_state_and_span_failures_still_abort_the_run():
+    record = tl.DESIGN[0]
+    tok = tl.FakeTokenizer()
+    roles = lh.prompt_roles(record, tl.STIM)
+    model = tl.FakeModel(n_blocks=4, bad=3, response=tl.perfect_response(record, roles),
+                         tokenizer=tok)
+    try:
+        sc.run_prompts([record], tl.STIM, model, tok, args=tl.FakeArgs(),
+                       device=CPU, architecture=_arch(4), verbose=False)
+    except lh.NonFiniteHiddenState as exc:
+        assert "index 3" in str(exc)
+    else:
+        raise AssertionError("a NaN hidden state did not abort the run")
+    templated, window = sc.build_chat_input(tok, lh.SYSTEM_PROMPT, record["prompt"])
+    try:
+        sc.extract_prompt_vectors(templated, ["not presented"], tok,
+                                  tl.FakeModel(n_blocks=4, tokenizer=tok),
+                                  device=CPU, architecture=_arch(4),
+                                  user_window=window, competitors=[])
+    except sc.SpanError:
+        pass
+    else:
+        raise AssertionError("an unresolvable span did not abort the run")
+
+
+# --- 24c. dynamic schema and architecture checks ---------------------------
+
+def test_a_48_block_fake_gives_the_49_level_primary_schema():
+    rows, _, meta = _scout_run([tl.DESIGN[0]])
+    assert meta["n_hidden_states"] == SCOUT_HIDDEN
+    assert list(rows[0]) == lh.primary_columns(SCOUT_HIDDEN)
+    assert "weat_layer48" in rows[0] and "delta_layer48" in rows[0]
+    assert "weat_layer49" not in rows[0]
+
+
+def test_the_scout_runner_hard_codes_no_layer_count():
+    for n in ("48", "49", "32", "33", "5120", "4096"):
+        assert not re.search(rf"\b{n}\b", SC_CODE), f"literal {n} in the runner"
+
+
+def test_architecture_validation_rejects_a_wrong_hidden_state_count():
+    states = [torch.zeros(1, 3, 8) for _ in range(SCOUT_HIDDEN)]
+    sc.check_architecture(states, _arch(SCOUT_BLOCKS))
+    _expect_exit(lambda: sc.check_architecture(states[:-1], _arch(SCOUT_BLOCKS)),
+                 "48 hidden states", "implies 49")
+    _expect_exit(lambda: _scout_run([tl.DESIGN[0]], n_blocks=47,
+                                    architecture=_arch(SCOUT_BLOCKS)),
+                 "implies 49")
+
+
+def test_architecture_validation_rejects_a_wrong_hidden_size():
+    states = [torch.zeros(1, 3, 8) for _ in range(SCOUT_HIDDEN)]
+    states[17] = torch.zeros(1, 3, 6)
+    _expect_exit(lambda: sc.check_architecture(states, _arch(SCOUT_BLOCKS)),
+                 "hidden state 17", "width 6")
+    _expect_exit(lambda: _scout_run([tl.DESIGN[0]], dim=6,
+                                    architecture=_arch(SCOUT_BLOCKS, 8)),
+                 "hidden_size is 8")
+
+
+def test_the_secondary_rows_cover_every_level_and_carry_the_scout_version():
+    acc = lh.PrototypeAccumulator()
+    records = tl.by_category(tl.DESIGN, "creativity")[:3] + \
+        [r for r in tl.DESIGN if r["domain"] == "fab"][:2]
+    _scout_run(records, n_blocks=SCOUT_BLOCKS, dim=6, acc=acc)
+    set_rows, stim_rows, _ = sc.secondary_rows(acc, records, tl.STIM, SCOUT_HIDDEN)
+    assert set_rows and stim_rows
+    assert len(set_rows) == 2 * SCOUT_HIDDEN
+    for r in set_rows + stim_rows:
+        assert r["analysis_version"] == sc.ANALYSIS_VERSION
+        assert r["analysis_version"] != lh.ANALYSIS_VERSION
+    assert max(r["hidden_state_index"] for r in set_rows) == SCOUT_BLOCKS
+    assert all(r["effect_size_sd"] == "population (ddof=0)" for r in set_rows)
+
+
+# --- 24d. Scout config, devices, loader -----------------------------------
+
+def test_text_config_of_prefers_the_nested_text_config():
+    text = types.SimpleNamespace(num_hidden_layers=48, hidden_size=5120)
+    assert sc.text_config_of(types.SimpleNamespace(text_config=text)) is text
+    flat = types.SimpleNamespace(num_hidden_layers=32, hidden_size=4096)
+    assert sc.text_config_of(flat) is flat
+    src = tl._code_only(inspect.getsource(sc.load_scout))
+    assert "tcfg = text_config_of(config)" in src
+    assert "int(tcfg.num_hidden_layers)" in src and "int(tcfg.hidden_size)" in src
+    assert "config.num_hidden_layers" not in src.replace("tcfg.", "")
+
+
+def test_the_real_scout_config_resolves_to_48_blocks_of_5120():
+    """Config JSON only — no weights."""
+    if not os.path.isdir(sc.CHECKPOINT):
+        print("    (skipped: no Scout checkpoint on this machine)")
+        return
+    from transformers import AutoConfig
+    tcfg = sc.text_config_of(AutoConfig.from_pretrained(sc.CHECKPOINT))
+    assert (tcfg.num_hidden_layers, tcfg.hidden_size) == (48, 5120)
+
+
+def test_the_input_device_is_the_embedding_entry_of_a_multi_gpu_map():
+    dmap = dict(SCOUT_DEVICE_MAP, **{"language_model.model.embed_tokens": 1})
+    assert sc.resolve_mapped_device(dmap, "language_model.model.embed_tokens") \
+        == torch.device("cuda:1")
+    assert sc.resolve_mapped_device(SCOUT_DEVICE_MAP,
+                                    "language_model.model.layers.40.mlp") \
+        == torch.device("cuda:2")
+    parent = {"vision_model": 0, "language_model.model": 2,
+              "language_model.lm_head": 1}
+    assert sc.resolve_mapped_device(parent, "language_model.model.embed_tokens") \
+        == torch.device("cuda:2")
+    assert sc.resolve_mapped_device({"": "cuda:1"}, "a.b") == torch.device("cuda:1")
+    _expect_exit(lambda: sc.resolve_mapped_device({"vision_model": 0},
+                                                  "language_model.model.embed_tokens"),
+                 "not covered")
+
+
+def test_the_embedding_module_is_found_by_identity_not_first_parameter():
+    model = _TinyLlama4(SCOUT_DEVICE_MAP)
+    assert sc.embedding_module_name(model) == "language_model.model.embed_tokens"
+    first = next(n for n, _ in model.named_parameters())
+    assert first.startswith("vision_model"), "fixture must put vision first"
+    for name in ("generate_response", "extract_prompt_vectors", "run_prompts",
+                 "smoke_test", "main", "load_scout"):
+        assert "next(model.parameters())" not in tl._code_only(
+            inspect.getsource(getattr(sc, name))), name
+
+
+def test_a_mapped_device_that_disagrees_with_the_weight_is_refused():
+    _expect_exit(lambda: sc.input_embedding_device(_TinyLlama4({"": 0})),
+                 "refusing to guess")
+
+
+def test_cpu_disk_and_meta_placements_are_rejected():
+    assert sc.validate_device_map(SCOUT_DEVICE_MAP) == ["cuda:0", "cuda:1", "cuda:2"]
+    for bad in ("cpu", "disk", "meta"):
+        dmap = dict(SCOUT_DEVICE_MAP, **{"language_model.model.layers.47": bad})
+        _expect_exit(lambda: sc.validate_device_map(dmap), "off-GPU", bad)
+        _expect_exit(lambda: sc.resolve_mapped_device(
+            {"language_model.model": bad}, "language_model.model.embed_tokens"),
+            bad)
+
+
+def test_an_empty_or_missing_device_map_is_rejected():
+    _expect_exit(lambda: sc.validate_device_map({}), "no hf_device_map")
+    _expect_exit(lambda: sc.validate_device_map(None), "no hf_device_map")
+    model = _TinyLlama4(None)
+    _expect_exit(lambda: sc.input_embedding_device(model), "not covered")
+
+
+def test_actual_parameter_devices_are_validated_too():
+    _expect_exit(lambda: sc.validate_parameter_devices(torch.nn.Linear(2, 2)),
+                 "cpu")
+    _expect_exit(lambda: sc.validate_parameter_devices(
+        torch.nn.Linear(2, 2, device="meta")), "meta")
+    src = tl._code_only(inspect.getsource(sc.load_scout))
+    assert "validate_parameter_devices(model)" in src
+
+
+def test_the_loader_is_the_verified_bf16_sdpa_auto_load():
+    src = tl._code_only(inspect.getsource(sc.load_scout))
+    assert "Llama4ForConditionalGeneration.from_pretrained(" in src
+    assert 'device_map="auto"' in src and "low_cpu_mem_usage=True" in src
+    assert "attn_implementation=ATTN_IMPLEMENTATION" in src
+    assert sc.ATTN_IMPLEMENTATION == "sdpa"
+    assert 'dtype="bfloat16"' in inspect.getsource(sc.load_scout).split(")")[0]
+    assert "validate_device_map(device_map)" in src and "model.eval()" in src
+    assert not re.search(r"max_memory\s*=", SC_CODE)
+    for banned in ("offload_folder", "offload_state_dict", "load_in_4bit",
+                   "load_in_8bit", "BitsAndBytesConfig", "quantization_config",
+                   "bitsandbytes"):
+        assert banned not in SC_CODE, banned
+
+
+def test_the_scout_runner_is_text_only():
+    for banned in ("pixel_values=", "AutoProcessor", "processor(", "<|image|>",
+                   "images="):
+        assert banned not in SC_CODE, banned
+
+
+# --- 24e. no legacy path --------------------------------------------------
+
+def test_no_legacy_scout_execution_path_remains():
+    for banned in ("load_sessions", "session_D", "session_arms", "eb.DATASETS",
+                   "eb.scoped", "jsonl", "behavioural_model",
+                   "SCOUT_BEHAVIOURAL_MODELS", "_assigned_items",
+                   "system_prompt_for", "preflight", "ollama", "Ollama",
+                   "load_backend", "parameter_footprint", "execution_device",
+                   "_gpu_budget", "_cpu_budget", "QUANTISATIONS",
+                   "nullify", "top_components", "max_valid_k", "pca", "PCA",
+                   "trial_layer_rows", "aggregate_pairs", "layer_correlations",
+                   "layer_association", "extract_prompt_hidden_states"):
+        assert banned not in SC_CODE, f"{banned!r} is still in the Scout runner"
+        assert not hasattr(sc, banned), f"sc.{banned} survived"
+
+
+def test_scout_writes_the_llama31_output_set_to_its_own_directory():
+    main_src = tl._code_only(inspect.getsource(sc.main))
+    assert "lh.PRIMARY_CSV" in main_src
+    for fname in lh.OUTPUT_FILES:
+        if fname != lh.PRIMARY_CSV:
+            assert f'"{fname}"' in main_src, fname
+    assert os.path.basename(sc.OUT_DIR) == "embed_scout"
+    assert sc.OUT_DIR != lh.OUT_DIR
+    legacy = {"hidden_trial_layer.csv", "hidden_pair_layer_aggregated.csv",
+              "hidden_layer_correlations.csv", "hidden_nullified_layer.csv",
+              "hidden_manifest.json"}
+    assert legacy.isdisjoint(lh.OUTPUT_FILES)
+
+
+def test_scout_dry_run_loads_no_tokenizer_or_model():
+    src = tl._code_only(inspect.getsource(sc.main))
+    dry = src.index("if args.dry_run:")
+    load = src.index("load_scout(")
+    assert dry < load
+    assert "AutoTokenizer" not in src[:load]
+
+
+# --- 24f. manifest and BOS -------------------------------------------------
+
+def test_the_scout_manifest_records_what_the_spec_requires():
+    m = _fake_manifest()
+    for key in ("analysis_version", "checkpoint", "model_class", "tokenizer",
+                "transformers_version", "torch_version", "dtype", "hf_device_map",
+                "devices", "input_embedding_module", "input_device",
+                "attn_implementation", "quantisation", "cpu_offload",
+                "disk_offload", "hidden_size", "n_transformer_blocks",
+                "n_hidden_states", "layer_convention", "modality", "pooling_rule",
+                "design", "generation", "generation_seed_rule", "bos",
+                "orientation", "behavioural_metric", "fail_fast",
+                "analysis_logic_source"):
+        assert key in m, key
+    assert m["analysis_version"] == sc.ANALYSIS_VERSION
+    assert m["hf_device_map"] == _fake_backend()["hf_device_map"]
+    assert m["attn_implementation"] == "sdpa" and m["quantisation"] == "none"
+    assert m["cpu_offload"] is False and m["disk_offload"] is False
+    assert m["n_hidden_states"] == SCOUT_HIDDEN
+    assert m["layer_convention"]["n_transformer_blocks"] == SCOUT_BLOCKS
+    assert m["generation"] == lh.GENERATION
+    assert m["design"]["prompts_sha256"] == lh.file_digest(lh.PROMPTS_CSV)
+    assert "architecture_mismatch" in m["fail_fast"]
+    src = m["analysis_logic_source"]
+    assert src["file"] == "embedding/embed_bias_llama3_hidden.py"
+    assert src["sha256"] == lh.file_digest(lh.__file__)
+
+
+def test_the_scout_manifest_carries_no_stale_llama31_description():
+    m = _fake_manifest()
+    m.pop("analysis_logic_source")                    # explicit provenance only
+    text = json.dumps(m, default=str)
+    for stale in ("Llama-3.1", "Llama 3.1", "llama3.1", "llama31", "Llama3",
+                  "/home/syryu", lh.ANALYSIS_VERSION, lh.CHECKPOINT,
+                  "3420-prompt"):
+        assert stale not in text, stale
+
+
+def test_the_bos_record_counts_template_and_tokenizer_bos_separately():
+    class _BosTok:
+        bos_token, bos_token_id = "<s>", 1
+
+        def __call__(self, text, **kw):
+            body = text[len("<s>"):] if text.startswith("<s>") else text
+            return {"input_ids": [1, 1] + [5] * len(body.split())}
+
+    rec = sc.bos_record(_BosTok(), "<s>hello there")
+    assert rec["bos_in_templated_text"] == 1 and rec["bos_in_model_input"] == 2
+    assert "kept deliberately" in rec["decision"]
+    for name in ("generate_response", "extract_prompt_vectors"):
+        assert "add_special_tokens" not in inspect.getsource(getattr(sc, name))
+
+
+def _scout_tokenizer():
+    if not os.path.isfile(os.path.join(sc.CHECKPOINT, "tokenizer.json")):
+        return None
+    from transformers import AutoTokenizer
+    return AutoTokenizer.from_pretrained(sc.CHECKPOINT)
+
+
+def test_the_real_scout_tokenizer_feeds_the_model_two_bos_tokens():
+    """Tokenizer only.  Same double BOS as the completed Llama 3.1 run."""
+    tok = _scout_tokenizer()
+    if tok is None:
+        print("    (skipped: no Scout tokenizer on this machine)")
+        return
+    templated, _ = sc.build_chat_input(tok, lh.SYSTEM_PROMPT, tl.DESIGN[0]["prompt"])
+    rec = sc.bos_record(tok, templated)
+    assert rec["bos_token"] == "<|begin_of_text|>"
+    assert rec["bos_in_templated_text"] == 1
+    assert rec["bos_in_model_input"] == 2
+    plain = tok(templated, add_special_tokens=False)["input_ids"]
+    assert sum(1 for i in plain[:3] if i == tok.bos_token_id) == 1
+    assert tok.is_fast
+
+
+def test_every_frozen_stimulus_resolves_under_the_real_scout_tokenizer():
+    tok = _scout_tokenizer()
+    if tok is None:
+        print("    (skipped: no Scout tokenizer on this machine)")
+        return
+    lo, hi, n_bos = sc.validate_all_spans(tok, tl.ON_DISK, tl.STIM)
+    assert n_bos == [2]
+    assert 0 < lo <= hi
 
 
 def main():

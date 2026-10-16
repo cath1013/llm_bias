@@ -1,102 +1,83 @@
+#!/usr/bin/env python3
 """
-PART B/C — MODEL-INTERNAL HIDDEN-STATE ANALYSIS  (Llama 4 Scout only)
+FIXED-PROMPT BAI-STYLE WAT — paired behaviour and hidden states, Llama-4-Scout.
 
-HOW THIS DIFFERS FROM `embed_bias.py`
-    `embed_bias.py` uses an OpenAI embedding model as an INDEPENDENT semantic
-    reference space.  It says nothing about any generating model's internals.
-    This file is the other thing: representations taken from the SAME model whose
-    behavioural WAT responses we collected (Scout).  The two analyses are kept
-    conceptually and programmatically separate; nothing here reads an API
-    embedding, and nothing in `embed_bias.py` reads a hidden state.
+WHAT THIS IS
+    The Llama-4-Scout port of `embed_bias_llama3_hidden.py`.  The SAME frozen
+    272 prompts (`embedding/prompts.csv`), the same system prompt, the same
+    sampling setting and prompt-id seed rule, the same strict behavioural parser
+    and unsmoothed Bai score, the same span resolution, competitor masking and
+    mean pooling, the same delta / singleton-WEAT equations and the same
+    secondary set-level WEAT.  A Scout row and a Llama 3.1 row with the same
+    `prompt_id` are directly comparable; the only intended difference is the
+    model, its backend, and therefore the number of layers.
 
-STATUS IN THIS REPOSITORY  —  the forward pass cannot run here
-    Every `scout-ctx` / `scout-ctx:latest` session in `responses/` was produced
-    through **Ollama** (`provider: "ollama"`, OpenAI-compatible
-    /v1/chat/completions; see `wat_fab.py` / `wat_gender_brilliance.py`).  That
-    interface returns text only.  Ollama's HTTP API has no per-layer hidden-state
-    output at all: `/api/embed` returns a single final-layer vector, which is NOT
-    a layer profile and is NOT what Bai's SI analysis used.
-    `preflight()` checks this at runtime and `main()` stops with that message
-    rather than substituting anything.  Substituting an API embedding, or a
-    different open model, for Scout's internals would make the analysis a
-    different claim, so this module refuses to do it.
+    Every model-independent function is CALLED from the Llama 3.1 runner
+    (`lh.<name>`), never copied, and that file is not modified.  What lives
+    here is only what the model forces:
 
-    What would be needed: Scout weights behind an interface that returns
-    `output_hidden_states=True` (HF transformers, vLLM with hidden-state return,
-    or llama.cpp patched to dump per-layer activations).
+        * the loader — Llama4ForConditionalGeneration, bf16, SDPA,
+          device_map="auto" across the visible GPUs, then hard checks that no
+          module or parameter sits on CPU, disk or meta;
+        * the input device — the device of the text input-embedding module
+          (`language_model.model.embed_tokens`) from hf_device_map, never
+          `next(model.parameters()).device`, which on Llama 4 is the vision
+          tower's;
+        * generate / forward / driver, identical to the Llama 3.1 runner apart
+          from that device and an architecture fail-fast check;
+        * the manifest's model-specific fields.
 
-WHAT IS IMPLEMENTED AND TESTED HERE
-    Everything that does not need the weights, so the analysis is ready the day a
-    hidden-state backend exists:
-      * robust exact-span location for multi-token phrases (B2), with explicit
-        failure on zero or ambiguous matches — not Bai's `.index()` on the first
-        token id,
-      * configurable pooling over a phrase's token span (mean default, last
-        optional), recorded in the manifest,
-      * Bai-inspired exploratory all-but-the-top-style PC nullification
-        (Part C), with k=0 an exact identity and the maximum k bounded by the
-        centred rank min(n_stimulus_vectors - 1, hidden_dim),
-      * layer-wise pair-aggregated Spearman/Pearson (B4), no pseudoreplication.
-    These are covered by `test_embed_bias.py`.  `extract_prompt_hidden_states()`
-    is written against the HF transformers API and is the only part this
-    environment cannot exercise.
+THIS FILE ALSO HOSTS THE GENERIC SPAN LAYER
+    `SpanError`, `find_phrase_char_spans`, `token_span_for_chars`,
+    `masking_spans`, `resolve_span`, `build_chat_input` and `pool_span` are
+    imported by the completed Llama 3.1 runner and are kept here unchanged.
+    They are defined BEFORE `embed_bias_llama3_hidden` is imported, and that
+    module is only dereferenced at call time, so the two files may be imported
+    in either order.
 
-INTERPRETATION BOUNDARIES
-    * A layer profile describes Scout's internal geometry while it READS the
-      prompt.  The generated response is never embedded.
-    * PC nullification is NOT debiasing.  It asks whether dominant shared
-      directions obscure the association of interest.  k=0 (unaltered) is the
-      primary analysis; nullified results are exploratory and stored separately.
-      It is Bai-inspired, not a reproduction of his `pca.py` (which re-adds the
-      mean; available here only as the explicit `add_mean_back=True` mode).
+RETIRED
+    The previous contents of this file — Ollama behavioural sessions,
+    saved-response replay, the old arms and scopes, PCA nullification, pair
+    aggregation and the quantised/offloaded backend — are retired.  Git history
+    is their provenance; none of it is reachable from here.
+
+LAYER CONVENTION
+    layer0   = hidden_states[0], the input embedding (before any block)
+    layer1.. = output of transformer block 1..N
+    N comes from config.text_config.num_hidden_layers (Scout: 48), and every
+    forward is checked to return N + 1 states of width text_config.hidden_size.
+    The primary table's layer columns are generated from that count.
+
+INPUT AND BOS
+    Exactly the Llama 3.1 pipeline: apply_chat_template(system + user,
+    tokenize=False, add_generation_prompt=True), then tokenizer(templated).
+    The template emits one BOS and the tokenizer prepends another, so the model
+    reads TWO BOS tokens — as the completed Llama 3.1 run did.  This is kept on
+    purpose and recorded in the manifest.
+
+TEXT ONLY
+    No processor, no image inputs, no image tokens.  The vision tower is
+    loaded with the checkpoint and never run.
 
 USAGE
-    # 1. what is and is not available (no weights touched)
-    python3 embedding/embed_bias_scout_hidden.py --preflight
-
-    # 2. smoke run: 20 sessions, writes nothing, proves the plumbing
-    .venv-hf/bin/python embedding/embed_bias_scout_hidden.py \
-        --hf-checkpoint <path to Llama-4-Scout> --limit 20
-
-    # 3. full run under the reported scope (4-bit NF4 by default)
-    .venv-hf/bin/python embedding/embed_bias_scout_hidden.py \
-        --hf-checkpoint <path> --quant 4bit --pca-k 2
-
-MODEL INPUT
-    The jsonl stores the user message only.  Scout actually read the runner's
-    system message plus that user message through the Llama-4 chat template, so
-    the forward pass rebuilds exactly that with `apply_chat_template`, and every
-    span lookup is confined to the user-message window inside the result.  The
-    generated response is still never embedded.
+    python3 embedding/embed_bias_scout_hidden.py --dry-run
+    python3 embedding/embed_bias_scout_hidden.py --smoke-test
+    python3 embedding/embed_bias_scout_hidden.py --limit 5 \\
+        --out-dir responses/embed_scout_diag5
+    python3 embedding/embed_bias_scout_hidden.py
 """
 
 import os
 import sys
-import re
-import math
-import csv
 import json
+import time
 import argparse
 from collections import defaultdict
-from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import embed_bias as eb           # stats + dataset wiring + behaviour recomputation
+import embed_bias as eb           # csv writer
 from embed_bias import ROOT       # project root, not this package directory
-
-ANALYSIS_VERSION = "2.0"
-OUT_DIR = os.path.join(ROOT, "responses", "embed_scout")
-
-# The behavioural model ids this analysis is about, and the Scout repo ids that
-# would be a legitimate source of its internals.
-SCOUT_BEHAVIOURAL_MODELS = ("scout-ctx", "scout-ctx:latest", "llama4:scout",
-                            "meta-llama/llama-4-scout-17b-16e-instruct")
-SCOUT_CHECKPOINT_PATTERN = re.compile(r"llama[-_ ]?4.*scout", re.I)
-
-OUTPUT_FILES = ["hidden_trial_layer.csv", "hidden_pair_layer_aggregated.csv",
-                "hidden_layer_correlations.csv", "hidden_nullified_layer.csv",
-                "hidden_manifest.json"]
 
 
 # =========================================================
@@ -195,16 +176,6 @@ def resolve_span(prompt, offsets, phrase, window=None, occurrence="single",
 # B1a — reconstruct the EXACT input the model saw
 # =========================================================
 
-def system_prompt_for(dataset):
-    """
-    The system message the behavioural runner sent, taken from the runner itself
-    (never hardcoded here).  Ollama applies the Modelfile's own SYSTEM only when
-    the request carries none; both runners send their own, so this is what Scout
-    actually read.
-    """
-    mod = {"fab": eb.wat_fab, "gb": eb.wgb}[dataset]
-    return mod.SYSTEM_PROMPT
-
 
 def build_chat_input(tokenizer, system, user_prompt):
     """
@@ -256,567 +227,490 @@ def pool_span(layer_matrix, span, rule="mean"):
 
 
 # =========================================================
-# Part C — all-but-the-top-k PCA nullification  (EXPLORATORY, Scout only)
+# The shared scientific logic
 # =========================================================
 
-def max_valid_k(n_vectors, dim):
-    """
-    Largest number of principal directions that exist for n mean-centred rows.
-    Centring costs one degree of freedom, so the centred matrix has rank at most
-    n - 1; e.g. 10 stimulus vectors in 4096-D admit k <= 9, never k = 10.
-    """
-    return max(0, min(int(n_vectors) - 1, int(dim)))
+# Imported HERE, after the span layer, because `embed_bias_llama3_hidden`
+# imports that layer from this file.  Only module attributes are read, and only
+# inside functions, so this works whichever of the two is imported first.
+import embed_bias_llama3_hidden as lh
+
+ANALYSIS_VERSION = "4.0-scout-fixed-prompt-bai"
+CHECKPOINT = "/home/kjin/models/llama4-scout"
+OUT_DIR = os.path.join(ROOT, "responses", "embed_scout")
+ATTN_IMPLEMENTATION = "sdpa"
+FORBIDDEN_PLACEMENTS = ("cpu", "disk", "meta")
 
 
-def nullify(vectors, k, add_mean_back=False):
-    """
-    All-but-the-top-style removal of the top-k principal directions of the
-    SUPPLIED stimulus-vector set (after Mu, Bhat & Viswanath 2018).
-
-    k = 0 returns the input unchanged, exactly — the primary (unaltered) analysis.
-    The PCA is fit ONLY on the vectors passed in; the caller records which ones
-    those were in the manifest.
-
-    This is Bai-INSPIRED exploratory PC nullification, not a reproduction of his
-    `pca.py`: his re-adds the mean after subtracting the projections, which is a
-    deviation from Mu et al. (cosine is scale- but not translation-invariant).
-    That behaviour is available as the explicit compatibility flag
-    `add_mean_back=True`, and is off by default.
-
-    This is NOT debiasing: the removed directions are the highest-variance ones,
-    defined without reference to the association being measured.
-    """
-    import numpy as np
-    V = np.asarray(vectors, dtype=float)
-    if k == 0:
-        return V.copy()
-    n_vectors, dim = V.shape
-    kmax = max_valid_k(n_vectors, dim)
-    if k > kmax:
-        raise ValueError(
-            f"k={k} exceeds the number of principal directions a mean-centred "
-            f"stimulus set can have: {n_vectors} stimulus vectors of dimension "
-            f"{dim} give a centred rank of at most min(n-1, dim) = {kmax}. "
-            f"Requested k={k}; use k <= {kmax} (k is never silently truncated).")
-    mean = V.mean(axis=0)
-    centred = V - mean
-    comps = top_components(centred, k)
-    out = centred - (centred @ comps.T) @ comps
-    return out + mean if add_mean_back else out
-
-
-def top_components(centred, k):
-    """
-    Top-k principal directions of already-centred rows, via SVD.
-    Equivalent to sklearn's PCA(n_components=k).components_ up to sign, and keeps
-    this module dependency-free (sklearn is not installed in this environment).
-    """
-    import numpy as np
-    _, _, vt = np.linalg.svd(np.asarray(centred, dtype=float), full_matrices=False)
-    return vt[:k]
+class ArchitectureMismatch(RuntimeError):
+    """A forward pass returned a hidden-state stack the config does not describe."""
 
 
 # =========================================================
-# B3/B4 — per-layer association and layer-wise correlation
+# Architecture metadata and device placement
 # =========================================================
 
-def layer_association(x_vec, y_vec, A, B):
+def text_config_of(config):
     """
-    One layer, one target pair: (delta, bai_singleton_weat).
-    `delta` is the unstandardised differential association — the PRIMARY measure,
-    for the same reason as in the external analysis: with one X and one Y, the
-    standardized score collapses toward +-2 and carries no magnitude.
+    The language model's config.  Llama 4 nests it under `text_config`, where
+    num_hidden_layers and hidden_size live; a plain causal LM does not.
     """
-    import numpy as np
-    X = np.asarray(x_vec, dtype=float)[None, :]
-    Y = np.asarray(y_vec, dtype=float)[None, :]
-    return (eb.weat_test_stat(X, Y, A, B), eb.bai_singleton_weat(X, Y, A, B))
+    return getattr(config, "text_config", None) or config
 
 
-def trial_layer_rows(vectors, arm, x, y, behavioural_D, *, n_layers, ks=(0,),
-                     pooling="mean", base=None):
+def _as_device_str(value):
+    """accelerate records GPU placements as ints; normalise to 'cuda:N'."""
+    if isinstance(value, int):
+        return f"cuda:{value}"
+    return str(value)
+
+
+def validate_device_map(device_map):
     """
-    One trial -> ONE ROW PER (hidden state, k).  `vectors` maps each stimulus
-    phrase to a list of per-layer vectors, as returned by
-    `extract_prompt_hidden_states`; `n_layers` is that model's actual hidden-state
-    count, never a hardcoded 33.
+    Every module on a GPU, or the run stops.  Returns the sorted devices used.
+
+    device_map="auto" quietly spills to CPU and then disk when the GPUs are
+    full.  The verified Scout load does not; a load that did would be a
+    different execution path, so it is refused rather than recorded.
     """
-    phrases = [x, y] + list(arm["A"]) + list(arm["B"])
-    rows = []
-    for layer in range(n_layers):
-        stim = [vectors[p][layer] for p in phrases]
-        for k in ks:
-            lookup = dict(zip(phrases, nullify(stim, k)))
-            delta, singleton = layer_association(
-                lookup[x], lookup[y],
-                [lookup[p] for p in arm["A"]], [lookup[p] for p in arm["B"]])
-            row = dict(base or {})
-            row.update(X_stimulus=x, Y_stimulus=y, pair=f"{x} || {y}",
-                       layer=layer, pca_k=k, pooling=pooling,
-                       delta=delta, bai_singleton_weat=singleton,
-                       behavioural_D=behavioural_D,
-                       analysis_version=ANALYSIS_VERSION)
-            rows.append(row)
-    return rows
+    if not device_map:
+        raise SystemExit("the model has no hf_device_map — expected a "
+                         "device_map='auto' load across the visible GPUs")
+    stray = {name: _as_device_str(dev) for name, dev in device_map.items()
+             if _as_device_str(dev).startswith(FORBIDDEN_PLACEMENTS)}
+    if stray:
+        raise SystemExit(f"{len(stray)} module(s) placed off-GPU "
+                         f"{dict(list(stray.items())[:5])} — this runner forbids "
+                         f"CPU/disk offload; refusing to continue")
+    return sorted({_as_device_str(d) for d in device_map.values()})
 
 
-def aggregate_pairs(trial_rows):
+def validate_parameter_devices(model):
     """
-    Collapse repeated sessions to unique (dataset, arm, model, layer, pair):
-    `delta_mean` (the statistic used downstream), its sample SD and its range as
-    separate columns, the mean behavioural D, and the session count.
-    Same anti-pseudoreplication rule as the external pair-level analysis.
+    {device: n_parameters}, after checking where every parameter ACTUALLY is.
+    The map can say cuda while an offload hook keeps the weight on meta/cpu.
     """
-    groups = defaultdict(list)
-    for r in trial_rows:
-        groups[(r["dataset"], r["arm"], r["behavioural_model"], r["layer"],
-                r["pair"])].append(r)
-    out = []
-    for (ds, arm, model, layer, pair), rs in sorted(groups.items(), key=str):
-        deltas = [r["delta"] for r in rs]
-        n = len(deltas)
-        mean = sum(deltas) / n
-        # sample SD (ddof=1); undefined for a single session, never a range
-        sd = (math.sqrt(sum((d - mean) ** 2 for d in deltas) / (n - 1))
-              if n >= 2 else float("nan"))
-        out.append(dict(
-            dataset=ds, arm=arm, behavioural_model=model, layer=layer, pair=pair,
-            X_stimulus=rs[0]["X_stimulus"], Y_stimulus=rs[0]["Y_stimulus"],
-            delta_mean=mean,                 # the value correlated downstream
-            delta=mean,                      # alias kept for readers of older files
-            delta_sd=sd,                     # sample SD, ddof=1, NaN if n == 1
-            delta_range=max(deltas) - min(deltas),
-            bai_singleton_weat=sum(r["bai_singleton_weat"] for r in rs) / n,
-            mean_behavioural_D=sum(r["behavioural_D"] for r in rs) / n,
-            n_sessions=n, analysis_version=ANALYSIS_VERSION))
-    return out
+    placement = defaultdict(int)
+    for _, p in model.named_parameters():
+        placement[str(p.device)] += 1
+    stray = [d for d in placement if d.startswith(FORBIDDEN_PLACEMENTS)]
+    if stray:
+        raise SystemExit(f"parameters landed on {stray} — this runner forbids "
+                         f"CPU/disk offload; refusing to continue")
+    return dict(placement)
 
 
-def layer_correlations(agg_rows, *, checkpoint, pooling, k=0, context="original prompt"):
+def resolve_mapped_device(device_map, module_name):
     """
-    Per (dataset, arm, behavioural model, layer): Spearman (primary) and Pearson
-    across UNIQUE PAIRS.  The full profile is returned; no layer is selected.
-    """
-    by = defaultdict(list)
-    for r in agg_rows:
-        by[(r["dataset"], r["arm"], r["behavioural_model"], r["layer"])].append(r)
-    rows = []
-    for (ds, arm, model, layer), rs in sorted(by.items(), key=str):
-        rec = eb.corr_record(
-            "scout_hidden_delta_vs_behavioural_D", ds, arm, model,
-            [r["delta_mean"] for r in rs], [r["mean_behavioural_D"] for r in rs],
-            emb_model=checkpoint, context=context, n_label="n_unique_pairs",
-            pooling=pooling,
-            n_sessions=sum(r["n_sessions"] for r in rs))
-        rec.update(layer=layer, pca_k=k)
-        rows.append(rec)
-    return rows
-
-
-# =========================================================
-# Preflight — is a hidden-state backend actually available?
-# =========================================================
-
-def _ollama_models():
-    base = (os.getenv("OLLAMA_BASE_URL", "").strip()
-            or "http://localhost:11434/v1").rsplit("/v1", 1)[0]
-    try:
-        import urllib.request
-        with urllib.request.urlopen(base + "/api/tags", timeout=5) as r:
-            return base, [m["name"] for m in json.load(r).get("models", [])]
-    except Exception as exc:
-        return base, f"unreachable ({exc.__class__.__name__})"
-
-
-def preflight(checkpoint=None):
-    """What exists, what does not, and whether the forward pass may run."""
-    info = {"scout_behavioural_sessions": {}, "blockers": []}
-
-    for ds, spec in eb.DATASETS.items():
-        counts = defaultdict(int)
-        for r in eb.load_sessions(spec):
-            if r.get("model") in SCOUT_BEHAVIOURAL_MODELS:
-                counts[(r.get("provider"), r.get("model"))] += 1
-        info["scout_behavioural_sessions"][ds] = {f"{p}/{m}": n
-                                                  for (p, m), n in sorted(counts.items())}
-
-    base, models = _ollama_models()
-    info["ollama_endpoint"] = base
-    info["ollama_models"] = models
-    info["ollama_exposes_hidden_states"] = False   # chat + /api/embed only, by design
-
-    try:
-        import torch
-        info["torch"] = torch.__version__
-        info["cuda_devices"] = [
-            {"name": torch.cuda.get_device_name(i),
-             "total_GiB": round(torch.cuda.get_device_properties(i).total_memory
-                                / 1024 ** 3, 1)}
-            for i in range(torch.cuda.device_count())]
-        info["total_VRAM_GiB"] = round(sum(d["total_GiB"]
-                                           for d in info["cuda_devices"]), 1)
-    except Exception:
-        info["torch"] = None
-        info["blockers"].append("torch is not installed in this environment")
-
-    try:
-        import transformers
-        from transformers.models.auto import modeling_auto  # noqa: F401
-        info["transformers"] = transformers.__version__
-        try:
-            from transformers import Llama4ForConditionalGeneration  # noqa: F401
-            info["llama4_supported"] = True
-        except ImportError:
-            info["llama4_supported"] = False
-            info["blockers"].append(
-                f"transformers {transformers.__version__} has no Llama-4 support; "
-                f"4.51+ is required for Llama4ForConditionalGeneration")
-    except ImportError:
-        info["transformers"] = None
-        info["blockers"].append("transformers is not installed in this environment")
-
-    try:
-        import bitsandbytes  # noqa: F401
-        info["bitsandbytes"] = True
-    except ImportError:
-        info["bitsandbytes"] = False     # only a blocker for a quantised load
-
-    # how much work a full run is, under the reported scope
-    work = {}
-    for ds, spec in eb.DATASETS.items():
-        arms = eb.scoped(ds, spec["arms"]())
-        prompts, trials = set(), 0
-        for r in eb.load_sessions(spec):
-            if r.get("model") not in SCOUT_BEHAVIOURAL_MODELS:
-                continue
-            for _ in spec["session_arms"](r, arms):
-                trials += 1
-                prompts.add(r["prompt"])
-        work[ds] = {"in_scope_trials": trials, "unique_prompts": len(prompts),
-                    "arms": sorted(arms)}
-    info["work_in_scope"] = work
-
-    info["hf_checkpoint"] = checkpoint
-    if checkpoint is None:
-        info["blockers"].append(
-            "no --hf-checkpoint given; the behavioural Scout runs used Ollama, "
-            "whose API returns text only (and /api/embed returns a single "
-            "final-layer vector, not per-layer hidden states)")
-    elif not SCOUT_CHECKPOINT_PATTERN.search(str(checkpoint)):
-        info["blockers"].append(
-            f"checkpoint {checkpoint!r} does not look like Llama-4-Scout; this "
-            f"module will not label another model's internals as Scout's")
-    elif not os.path.exists(str(checkpoint)):
-        info["blockers"].append(f"checkpoint path {checkpoint!r} does not exist")
-
-    info["can_run_forward_pass"] = not info["blockers"]
-    return info
-
-
-# =========================================================
-# B1 — forward pass over the ORIGINAL saved prompts
-# =========================================================
-
-def execution_device(model):
-    """
-    Where the input tensors must live.
-
-    `model.device` is the device of the first parameter, which for an offloaded
-    model is `meta` or `cpu` -- neither of which is where the forward actually
-    runs.  accelerate records the real answer in `hf_device_map`: the first
-    accelerator in it is the execution device that offloaded modules are copied
-    to for each forward pass.
+    The device hf_device_map assigns to `module_name`: the entry with the
+    longest key that is that module or one of its ancestors ('' is the root).
     """
     import torch
-    for dev in (getattr(model, "hf_device_map", None) or {}).values():
-        if str(dev) not in ("cpu", "disk", "meta"):
-            return torch.device(dev if not isinstance(dev, int) else f"cuda:{dev}")
-    dev = getattr(model, "device", None)
-    if dev is None or str(dev) == "meta":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return dev
+    best = None
+    for key in device_map:
+        if key == "" or module_name == key or module_name.startswith(key + "."):
+            if best is None or len(key) > len(best):
+                best = key
+    if best is None:
+        raise SystemExit(f"{module_name!r} is not covered by hf_device_map")
+    dev = _as_device_str(device_map[best])
+    if dev.startswith(FORBIDDEN_PLACEMENTS):
+        raise SystemExit(f"{module_name!r} is mapped to {dev!r} via {best!r}; "
+                         f"inputs must start on a GPU")
+    return torch.device(dev)
 
 
-def extract_prompt_hidden_states(prompt, phrases, tokenizer, model,
-                                 pooling="mean", windows=None,
-                                 default_window=None, competitors=()):
+def embedding_module_name(model):
+    """Qualified name of `model.get_input_embeddings()` inside `model`."""
+    emb = model.get_input_embeddings()
+    for name, module in model.named_modules():
+        if module is emb:
+            return name
+    raise SystemExit("get_input_embeddings() is not a submodule of the model")
+
+
+def input_embedding_device(model):
     """
-    One forward pass over the EXACT input the model saw; returns
-    {phrase: [vector per hidden state]} plus architecture metadata.
+    (device, module_name) for the inputs of BOTH generate() and forward().
 
-    `prompt` is the templated text from `build_chat_input`, and
-    `default_window` is its user-message span: every phrase is looked up inside
-    that window unless `windows` gives it a narrower one.
+    On Llama4ForConditionalGeneration the text embedding is
+    `language_model.model.embed_tokens`.  The device is read from
+    hf_device_map and must agree with where the embedding weight really is.
+    """
+    name = embedding_module_name(model)
+    dev = resolve_mapped_device(getattr(model, "hf_device_map", None) or {}, name)
+    actual = model.get_input_embeddings().weight.device
+    if actual != dev:
+        raise SystemExit(f"hf_device_map puts {name!r} on {dev} but its weight "
+                         f"is on {actual}; refusing to guess the input device")
+    return dev, name
 
-    The generated response is never embedded.  The number of hidden states comes
-    from the model (len(outputs.hidden_states)); nothing is hardcoded.  Index 0 is
-    the embedding/input representation, 1..n the transformer block outputs.
 
-    Only reachable once `preflight()` reports a hidden-state-capable backend; this
-    environment has none, so this function is unexercised here by design.
+def check_architecture(hidden_states, architecture, context=""):
+    """
+    len(hidden_states) == num_hidden_layers + 1, and every state has width
+    hidden_size.  A mismatch means the layer columns would not mean what the
+    manifest says, so the run stops.
+    """
+    want = architecture["n_transformer_blocks"] + 1
+    if len(hidden_states) != want:
+        raise ArchitectureMismatch(
+            f"forward returned {len(hidden_states)} hidden states; text_config "
+            f"implies {want} (1 input embedding + "
+            f"{architecture['n_transformer_blocks']} blocks)"
+            + (f" [{context}]" if context else "") + " — aborting the run")
+    for i, h in enumerate(hidden_states):
+        if int(h.shape[-1]) != architecture["hidden_size"]:
+            raise ArchitectureMismatch(
+                f"hidden state {i} has width {int(h.shape[-1])}; text_config "
+                f"hidden_size is {architecture['hidden_size']}"
+                + (f" [{context}]" if context else "") + " — aborting the run")
+
+
+def leading_bos_count(tokenizer, templated):
+    """BOS ids opening the tokenised input (template BOS + tokenizer BOS)."""
+    ids = tokenizer(templated)["input_ids"]
+    bos = tokenizer.bos_token_id
+    n = 0
+    while n < len(ids) and ids[n] == bos:
+        n += 1
+    return n
+
+
+def bos_record(tokenizer, templated):
+    """What the manifest says about BOS, measured rather than asserted."""
+    bos = tokenizer.bos_token
+    in_template = 0
+    while templated.startswith(bos * (in_template + 1)):
+        in_template += 1
+    return {
+        "bos_token": bos,
+        "bos_token_id": tokenizer.bos_token_id,
+        "bos_in_templated_text": in_template,
+        "bos_in_model_input": leading_bos_count(tokenizer, templated),
+        "how": "apply_chat_template(..., tokenize=False) emits one BOS; "
+               "tokenizer(templated) prepends another special BOS",
+        "decision": "kept deliberately: the completed Llama 3.1 run fed the "
+                    "model the same double BOS, so preprocessing is comparable "
+                    "across the two models",
+    }
+
+
+# =========================================================
+# Model
+# =========================================================
+
+def load_scout(checkpoint=CHECKPOINT, dtype="bfloat16"):
+    """
+    The verified multi-GPU bf16 load.  No quantisation, no `max_memory`, no
+    offload folder; any CPU/disk/meta placement aborts.
     """
     import torch
-    enc = tokenizer(prompt, return_tensors="pt", return_offsets_mapping=True)
+    from transformers import (AutoConfig, AutoTokenizer,
+                              Llama4ForConditionalGeneration)
+
+    if not os.path.isdir(checkpoint):
+        raise SystemExit(f"checkpoint not found: {checkpoint}")
+    shards = sorted(f for f in os.listdir(checkpoint) if f.endswith(".safetensors"))
+    if not shards:
+        raise SystemExit(f"no safetensors in {checkpoint}")
+
+    torch_dtype = getattr(torch, dtype)
+    config = AutoConfig.from_pretrained(checkpoint)
+    tcfg = text_config_of(config)
+    tokenizer = AutoTokenizer.from_pretrained(checkpoint)
+    if not getattr(tokenizer, "is_fast", False):
+        raise SystemExit("a fast tokenizer is required for offset-based spans")
+
+    t0 = time.time()
+    model = Llama4ForConditionalGeneration.from_pretrained(
+        checkpoint, dtype=torch_dtype, device_map="auto",
+        attn_implementation=ATTN_IMPLEMENTATION, low_cpu_mem_usage=True)
+    load_seconds = time.time() - t0
+    model.eval()
+
+    device_map = dict(getattr(model, "hf_device_map", None) or {})
+    devices = validate_device_map(device_map)
+    placement = validate_parameter_devices(model)
+    input_device, embed_name = input_embedding_device(model)
+    param_dtypes = defaultdict(int)
+    for _, p in model.named_parameters():
+        param_dtypes[str(p.dtype)] += 1
+
+    gen_cfg = getattr(model, "generation_config", None)
+    meta = dict(
+        checkpoint=checkpoint,
+        safetensors_shards=shards,
+        ignored_duplicates=[],
+        model_class=model.__class__.__name__,
+        architectures=list(getattr(config, "architectures", []) or []),
+        dtype=str(model.dtype),
+        parameter_dtypes=dict(param_dtypes),
+        tokenizer_class=tokenizer.__class__.__name__,
+        n_transformer_blocks=int(tcfg.num_hidden_layers),
+        hidden_size=int(tcfg.hidden_size),
+        num_local_experts=getattr(tcfg, "num_local_experts", None),
+        num_experts_per_tok=getattr(tcfg, "num_experts_per_tok", None),
+        attn_implementation=getattr(model.config, "_attn_implementation",
+                                    ATTN_IMPLEMENTATION),
+        device=", ".join(devices),
+        devices=devices,
+        input_device=str(input_device),
+        input_embedding_module=embed_name,
+        device_placement=placement,
+        hf_device_map={k: _as_device_str(v) for k, v in device_map.items()},
+        checkpoint_generation_config=(gen_cfg.to_diff_dict()
+                                      if gen_cfg is not None else None),
+        quantisation="none",
+        cpu_offload=False,
+        disk_offload=False,
+        load_seconds=round(load_seconds, 2),
+    )
+    return model, tokenizer, meta
+
+
+def generate_response(templated, tokenizer, model, *, seed, device,
+                      generation=None):
+    """
+    `lh.generate_response`, with the input device passed in.  Generation is
+    for behaviour only; its tokens are never embedded or pooled.
+    """
+    import torch
+    cfg = dict(lh.GENERATION if generation is None else generation)
+    enc = tokenizer(templated, return_tensors="pt")
+    enc = {k: v.to(device) for k, v in enc.items()}
+    pad = tokenizer.pad_token_id
+    if pad is None:
+        pad = tokenizer.eos_token_id
+
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    t0 = time.time()
+    with torch.inference_mode():
+        out = model.generate(**enc, pad_token_id=pad, **cfg)
+    seconds = time.time() - t0
+
+    new_tokens = out[0][enc["input_ids"].shape[1]:]
+    text = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+    return text, dict(seed=seed, n_new_tokens=int(new_tokens.shape[0]),
+                      generate_seconds=seconds, **cfg)
+
+
+def extract_prompt_vectors(templated, phrases, tokenizer, model, *, device,
+                           architecture, user_window, competitors,
+                           pooling="mean", context=""):
+    """
+    `lh.extract_prompt_vectors`, with the input device passed in and the
+    hidden-state stack checked against text_config before anything is pooled.
+    """
+    import torch
+    import numpy as np
+
+    enc = tokenizer(templated, return_tensors="pt", return_offsets_mapping=True)
     offsets = [tuple(o) for o in enc.pop("offset_mapping")[0].tolist()]
-    enc = {k: v.to(execution_device(model)) for k, v in enc.items()}
-    with torch.no_grad():
+    enc = {k: v.to(device) for k, v in enc.items()}
+
+    t0 = time.time()
+    with torch.inference_mode():
         out = model(**enc, output_hidden_states=True)
+    forward_seconds = time.time() - t0
+
+    lh.assert_finite_hidden_states(out.hidden_states, context)
+    check_architecture(out.hidden_states, architecture, context)
     hidden = [h[0].to(dtype=torch.float32).cpu().numpy() for h in out.hidden_states]
 
-    vectors = {}
+    spans, vectors = {}, {}
     for phrase in phrases:
-        span = resolve_span(prompt, offsets, phrase,
-                            window=(windows or {}).get(phrase, default_window),
-                            competitors=competitors)
-        vectors[phrase] = [pool_span(layer, span, pooling) for layer in hidden]
-    meta = dict(n_hidden_states=len(hidden),
-                layer_0="embedding/input representation",
-                layers_1_to_n="transformer block outputs",
-                n_transformer_blocks=len(hidden) - 1,
-                hidden_size=int(hidden[0].shape[-1]),
-                n_prompt_tokens=int(hidden[0].shape[0]),
-                pooling=pooling)
+        span = resolve_span(templated, offsets, phrase, window=user_window,
+                            competitors=[c for c in competitors if c != phrase])
+        spans[phrase] = span
+        pooled = [pool_span(layer, span, pooling) for layer in hidden]
+        for i, v in enumerate(pooled):
+            if not np.isfinite(v).all():
+                raise lh.NonFiniteHiddenState(
+                    f"pooled vector for {phrase!r} is non-finite at hidden state "
+                    f"{i} ({lh.layer_label(i)['representation_type']})"
+                    + (f" [{context}]" if context else "")
+                    + " — aborting the run")
+        vectors[phrase] = pooled
+
+    meta = dict(
+        n_hidden_states=len(hidden),
+        n_transformer_blocks=len(hidden) - 1,
+        hidden_size=int(hidden[0].shape[-1]),
+        n_prompt_tokens=int(hidden[0].shape[0]),
+        pooling=pooling,
+        forward_seconds=forward_seconds,
+        spans={p: list(s) for p, s in spans.items()},
+        subtokens={p: tokenizer.convert_ids_to_tokens(
+            enc["input_ids"][0][s[0]:s[1]].tolist()) for p, s in spans.items()},
+        finite_check="pass",
+    )
     return vectors, meta
 
 
 # =========================================================
-# Backend — load Scout so that it returns hidden states
+# Driver
 # =========================================================
 
-QUANTISATIONS = ("bf16", "4bit", "8bit")
-
-GIB = float(1 << 30)
-
-
-def _auto_model_classes():
+def run_prompts(prompts, stim, model, tokenizer, *, args, device, architecture,
+                acc=None, verbose=True):
     """
-    The candidate auto-classes, in the order this module tries them.
-
-    Llama-4 ships as a multimodal wrapper (`Llama4ForConditionalGeneration`), so
-    the causal-LM mapping can refuse it; text-only input still returns the
-    language model's hidden states through the image-text class.
+    `lh.run_prompts`, with the input device and architecture passed through:
+    one generate() and one forward() per frozen prompt.
     """
-    from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
-    return (AutoModelForCausalLM, AutoModelForImageTextToText)
+    rows, failures = [], []
+    n_hidden = None
+    t_start = time.time()
+    for k, record in enumerate(prompts, start=1):
+        roles = lh.prompt_roles(record, stim)
+        templated, window = build_chat_input(tokenizer, lh.SYSTEM_PROMPT,
+                                             record["prompt"])
+        context = record["prompt_id"]
+
+        response, gen_meta = generate_response(
+            templated, tokenizer, model, device=device,
+            seed=lh.prompt_seed(record["prompt_id"], args.seed),
+            generation=dict(lh.GENERATION, max_new_tokens=args.max_new_tokens))
+
+        vectors, meta = extract_prompt_vectors(
+            templated, roles["phrases"], tokenizer, model, device=device,
+            architecture=architecture,
+            user_window=window, competitors=roles["phrases"], context=context)
+        n_hidden = meta["n_hidden_states"]
+
+        assign, problems = lh.parse_behaviour(response, record, roles)
+        if problems:
+            score = float("nan")
+            failures.append(dict(prompt_id=record["prompt_id"],
+                                 domain=record["domain"],
+                                 category=record["category"],
+                                 trial=record["trial"],
+                                 n_items_assigned=len(assign),
+                                 n_items_presented=len(roles["attributes"]),
+                                 problems=" | ".join(problems),
+                                 response=response))
+        else:
+            score, denom_problem = lh.behaviour_wat_score(assign, record, roles)
+            if denom_problem:
+                failures.append(dict(prompt_id=record["prompt_id"],
+                                     domain=record["domain"],
+                                     category=record["category"],
+                                     trial=record["trial"],
+                                     n_items_assigned=len(assign),
+                                     n_items_presented=len(roles["attributes"]),
+                                     problems=denom_problem,
+                                     response=response))
+
+        deltas, weats = lh.representation_scores(vectors, roles, n_hidden)
+        rows.append(lh.wide_row(record, response, score, deltas, weats))
+
+        if acc is not None:
+            lh.accumulate_prompt(acc, record["domain"], record["category"],
+                                 vectors, roles["phrases"], record["prompt_id"])
+        if verbose:
+            elapsed = time.time() - t_start
+            print(f"  [{k:3d}/{len(prompts)}] {record['prompt_id']:<22} "
+                  f"bias={score:+.3f}  delta_L{n_hidden-1}={deltas[-1]:+.5f}  "
+                  f"gen={gen_meta['generate_seconds']:.1f}s "
+                  f"fwd={meta['forward_seconds']:.2f}s  "
+                  f"({elapsed/k:.1f}s/prompt)", flush=True)
+
+    return rows, failures, dict(n_hidden_states=n_hidden,
+                                total_seconds=time.time() - t_start)
 
 
-def parameter_footprint(checkpoint, quant="bf16", bytes_per_param=2.0):
+def restamp(rows):
     """
-    Measure what `quant` would actually shrink, on meta tensors: no weights are
-    read, so this is cheap enough to run before every load.
-
-    bitsandbytes replaces `nn.Linear` MODULES.  A weight held directly on a
-    module as an `nn.Parameter` is therefore left at full precision -- and
-    Llama-4's mixture-of-experts stacks (`Llama4TextExperts.gate_up_proj`,
-    `.down_proj`) are exactly that: 3-D `nn.Parameter`s, not `nn.Linear`.  On
-    Scout that is 96.6 of 108.6 billion parameters, so `load_in_4bit` shrinks
-    only a ninth of the model.
-
-    Returns a dict of parameter counts and the resulting GiB, so a caller can
-    say WHY a load does or does not fit rather than asserting it.
+    The secondary builders live in lh and stamp lh's version; these rows are
+    Scout's.  Nothing else in a row is touched.
     """
-    import torch.nn as nn
-    from accelerate import init_empty_weights
-    from transformers import AutoConfig, PretrainedConfig
-
-    # A config may be passed directly, which lets the measurement be exercised
-    # on a small architecture instead of a 200 GiB checkpoint.
-    cfg = (checkpoint if isinstance(checkpoint, PretrainedConfig)
-           else AutoConfig.from_pretrained(checkpoint))
-    model, errors = None, []
-    with init_empty_weights():
-        for cls in _auto_model_classes():
-            try:
-                model = cls.from_config(cfg)
-                break
-            except (ValueError, KeyError) as exc:
-                errors.append(f"{cls.__name__}: {exc.__class__.__name__}")
-    if model is None:
-        raise RuntimeError("no auto-class accepted this config: "
-                           + "; ".join(errors))
-
-    quantisable = unquantisable = 0
-    seen = set()
-    for mod_name, mod in model.named_modules():
-        is_linear = isinstance(mod, nn.Linear)
-        for par_name, par in mod.named_parameters(recurse=False):
-            full = f"{mod_name}.{par_name}"
-            if full in seen:
-                continue
-            seen.add(full)
-            if is_linear and par_name == "weight":
-                quantisable += par.numel()
-            else:
-                unquantisable += par.numel()
-
-    per_param = {"4bit": 0.5, "8bit": 1.0, "bf16": bytes_per_param}[quant]
-    quantised_bytes = quantisable * (per_param if quant != "bf16"
-                                     else bytes_per_param)
-    total_gib = (quantised_bytes + unquantisable * bytes_per_param) / GIB
-    return dict(
-        quant=quant,
-        total_params=quantisable + unquantisable,
-        params_in_linear=quantisable,
-        params_outside_linear=unquantisable,
-        full_precision_gib=(quantisable + unquantisable) * bytes_per_param / GIB,
-        footprint_gib=total_gib,
-        shrinkable_fraction=quantisable / max(1, quantisable + unquantisable))
+    for r in rows:
+        r["analysis_version"] = ANALYSIS_VERSION
+    return rows
 
 
-def _gpu_budget(reserve_gib=4.0):
-    """Free VRAM per visible device, less a per-device reserve for activations."""
-    import torch
-    if not torch.cuda.is_available():
-        return {}
-    budget = {}
-    for i in range(torch.cuda.device_count()):
-        free, _total = torch.cuda.mem_get_info(i)
-        budget[i] = max(0.0, free / GIB - reserve_gib)
-    return budget
+def secondary_rows(acc, prompts, stim, n_hidden):
+    """(set-level rows, stimulus-layer rows, missing), Scout-stamped."""
+    set_rows, stim_rows, missing = [], [], {}
+    for domain, category in sorted({(r["domain"], r["category"]) for r in prompts}):
+        arm = lh.arm_for(domain, category, stim)
+        if not acc.stimuli(domain, category):
+            continue
+        srows, miss = lh.set_level_rows(acc, domain, category, arm,
+                                        n_hidden_states=n_hidden)
+        set_rows.extend(restamp(srows))
+        if any(miss.values()):
+            missing[f"{domain}/{category}"] = {k: v for k, v in miss.items() if v}
+        stim_rows.extend(restamp(lh.stimulus_layer_rows(
+            acc, domain, category, arm, n_hidden_states=n_hidden)))
+    return set_rows, stim_rows, missing
 
 
-def _cpu_budget(reserve_gib=8.0):
-    """MemAvailable, less a reserve for the loading process and the OS."""
-    try:
-        with open("/proc/meminfo", encoding="utf-8") as fh:
-            for line in fh:
-                if line.startswith("MemAvailable:"):
-                    return max(0.0, int(line.split()[1]) / (1 << 20) - reserve_gib)
-    except OSError:
-        pass
-    return 0.0
+# =========================================================
+# Manifest
+# =========================================================
 
-
-def load_backend(checkpoint, quant="bf16", device_map="auto",
-                 offload_folder=None, gpu_reserve_gib=4.0, cpu_reserve_gib=8.0):
+def build_manifest(*, backend, arch, design, n_hidden_states, parse_failures,
+                   generation, missing, args, bos):
     """
-    Load the checkpoint for PREFILL ONLY (no generation) with hidden states on.
-
-    The default is bf16 -- the checkpoint's own dtype -- spilled across GPUs,
-    host RAM and, if needed, `offload_folder`, because 4-bit does NOT work on
-    this architecture: see `parameter_footprint`.  bitsandbytes quantises
-    `nn.Linear` only, and Scout keeps 89% of its parameters in `nn.Parameter`
-    expert stacks, so `load_in_4bit` leaves ~180 GiB untouched and then refuses
-    the CPU dispatch it has itself made unavoidable.  Loading at bf16 also
-    removes a confound: internals and behaviour then differ in SERVING STACK
-    (Ollama Q4_K_M generated the sessions) but not in the weights' precision on
-    the internals side, and the manifest records both.
-
-    Returns (tokenizer, model, meta).
+    The Llama 3.1 manifest, key for key, with every model-specific field
+    replaced so the two can be diffed — and nothing left that describes the
+    other model, except the explicit `analysis_logic_source` provenance.
     """
-    import torch
-    from transformers import AutoConfig, AutoTokenizer
-
-    if quant not in QUANTISATIONS:
-        raise ValueError(f"unknown quantisation {quant!r}; expected one of "
-                         f"{QUANTISATIONS}")
-
-    tok = AutoTokenizer.from_pretrained(checkpoint)
-    if not getattr(tok, "is_fast", False):
-        raise RuntimeError("a FAST tokenizer is required: span location uses "
-                           "offset mappings, which the slow tokenizer lacks")
-    if getattr(tok, "chat_template", None) in (None, ""):
-        raise RuntimeError("the tokenizer carries no chat template, so the "
-                           "behavioural input cannot be reconstructed")
-
-    gpu = _gpu_budget(gpu_reserve_gib)
-    cpu = _cpu_budget(cpu_reserve_gib)
-    fp = parameter_footprint(checkpoint, quant=quant)
-    gpu_total = sum(gpu.values())
-
-    print(f"  footprint at {quant}: {fp['footprint_gib']:.1f} GiB "
-          f"({fp['total_params']/1e9:.1f}B params, "
-          f"{fp['shrinkable_fraction']*100:.0f}% of them inside nn.Linear)")
-    print(f"  budget: {gpu_total:.1f} GiB across {len(gpu)} GPU(s) "
-          f"+ {cpu:.1f} GiB host RAM"
-          + (f" + {offload_folder}" if offload_folder else " (no disk offload)"))
-
-    # bitsandbytes cannot place a quantised module on CPU or disk, so a 4/8-bit
-    # load must fit in VRAM outright.  Say so with the measured numbers instead
-    # of letting from_pretrained raise its generic dispatch error.
-    if quant in ("4bit", "8bit") and fp["footprint_gib"] > gpu_total:
-        raise SystemExit(
-            f"\n{quant} CANNOT LOAD THIS CHECKPOINT\n"
-            f"  bitsandbytes converts nn.Linear modules only.  "
-            f"{fp['params_outside_linear']/1e9:.1f}B of this model's "
-            f"{fp['total_params']/1e9:.1f}B parameters sit outside nn.Linear "
-            f"(Llama-4 holds its MoE experts as 3-D nn.Parameter stacks), so "
-            f"they stay at full precision.\n"
-            f"  {quant} footprint {fp['footprint_gib']:.1f} GiB > "
-            f"{gpu_total:.1f} GiB of free VRAM, and a quantised module cannot "
-            f"be offloaded to CPU or disk.\n"
-            f"  Use --quant bf16, which may be offloaded "
-            f"({fp['full_precision_gib']:.1f} GiB across VRAM + RAM + disk).")
-
-    kwargs = dict(device_map=device_map, dtype=torch.bfloat16,
-                  low_cpu_mem_usage=True)
-    if quant in ("4bit", "8bit"):
-        from transformers import BitsAndBytesConfig
-        kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=(quant == "4bit"), load_in_8bit=(quant == "8bit"),
-            bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=torch.bfloat16)
-    else:
-        # An explicit budget: accelerate's default leaves most of host RAM
-        # unused, which on this model is the difference between spilling a few
-        # GiB to disk and spilling tens of GiB to it.
-        max_memory = {i: f"{g:.1f}GiB" for i, g in gpu.items()}
-        if cpu > 0:
-            max_memory["cpu"] = f"{cpu:.1f}GiB"
-        if max_memory:
-            kwargs["max_memory"] = max_memory
-        if offload_folder:
-            os.makedirs(offload_folder, exist_ok=True)
-            kwargs["offload_folder"] = offload_folder
-            kwargs["offload_state_dict"] = True
-
-    cfg = AutoConfig.from_pretrained(checkpoint)
-    arch = (getattr(cfg, "architectures", None) or [""])[0]
-
-    def _load(cls):
-        try:
-            return cls.from_pretrained(checkpoint, **kwargs)
-        except TypeError as exc:
-            if "dtype" not in str(exc):
-                raise
-            bc = dict(kwargs)                      # transformers < 4.56
-            bc["torch_dtype"] = bc.pop("dtype")
-            return cls.from_pretrained(checkpoint, **bc)
-
-    model, loaded_with, errors = None, None, []
-    for cls in _auto_model_classes():
-        try:
-            model = _load(cls)
-            loaded_with = cls.__name__
-            break
-        except (ValueError, KeyError) as exc:
-            errors.append(f"{cls.__name__} refused ({exc.__class__.__name__}: {exc})")
-            print(f"  {errors[-1].splitlines()[0]}")
-    if model is None:
-        raise RuntimeError("no auto-class could load this checkpoint:\n  "
-                           + "\n  ".join(errors))
-    model.eval()
-
-    placement = {}
-    for dev in (getattr(model, "hf_device_map", None) or {}).values():
-        placement[str(dev)] = placement.get(str(dev), 0) + 1
-    if placement:
-        print(f"  placement: {placement}")
-
-    import transformers
-    meta = dict(checkpoint=str(checkpoint), quantisation=quant,
-                config_architecture=arch, loaded_with=loaded_with,
-                transformers=transformers.__version__, torch=torch.__version__,
-                device_map=device_map, module_placement=placement,
-                footprint=fp,
-                quantisation_note=("behaviour came from the Q4_K_M GGUF served "
-                                   "by Ollama; these internals come from a "
-                                   f"{quant} load of the same checkpoint")
-                if quant != "bf16" else
-                ("unquantised (checkpoint dtype); behaviour came from the "
-                 "Q4_K_M GGUF served by Ollama, so the two differ in serving "
-                 "stack, not in the precision of these internals"))
-    return tok, model, meta
+    m = lh.build_manifest(backend=backend, arch=arch, design=design,
+                          n_hidden_states=n_hidden_states,
+                          parse_failures=parse_failures, generation=generation,
+                          missing=missing, args=args)
+    m.pop("ignored_duplicate_weights", None)
+    m["analysis"] = ("Fixed-prompt Bai-style WAT: paired Llama-4-Scout "
+                     "behaviour and contextualised hidden states from the same "
+                     "prompt")
+    m["analysis_version"] = ANALYSIS_VERSION
+    m["analysis_logic_source"] = {
+        "file": os.path.relpath(lh.__file__, ROOT),
+        "sha256": lh.file_digest(lh.__file__),
+        "shared": "design, roles, behavioural parsing and score, span "
+                  "resolution, pooling, delta / singleton WEAT, prototype "
+                  "accumulation and set-level WEAT are called from this file "
+                  "unchanged",
+    }
+    m["layer_convention"]["layerN"] = (
+        f"layer{n_hidden_states - 1}: output of block {n_hidden_states - 1} "
+        f"after the final RMSNorm (transformers ties the last hidden state to "
+        f"last_hidden_state)")
+    m["architecture_source"] = ("config.text_config.num_hidden_layers / "
+                                "hidden_size")
+    m["fail_fast"]["architecture_mismatch"] = (
+        "aborts the run: every forward must return num_hidden_layers + 1 "
+        "states, each of width hidden_size")
+    m["secondary_outputs"]["set_level_weat"] = (
+        "contextual prototypes over THIS experiment's prompts only")
+    m["secondary_outputs"]["analysis_version"] = (
+        "every secondary row is stamped " + ANALYSIS_VERSION)
+    m.update({
+        "devices": backend["devices"],
+        "hf_device_map": backend["hf_device_map"],
+        "device_placement": backend["device_placement"],
+        "input_embedding_module": backend["input_embedding_module"],
+        "input_device": backend["input_device"],
+        "input_device_rule": "device of get_input_embeddings() from "
+                             "hf_device_map (longest matching ancestor), "
+                             "checked against its weight; used for generate() "
+                             "and forward()",
+        "attn_implementation": backend["attn_implementation"],
+        "parameter_dtypes": backend["parameter_dtypes"],
+        "num_local_experts": backend["num_local_experts"],
+        "num_experts_per_tok": backend["num_experts_per_tok"],
+        "modality": "text only — no processor, no image inputs, no image "
+                    "tokens; the vision tower is loaded but never run",
+        "checkpoint_generation_config": backend["checkpoint_generation_config"],
+        "generation_override": "the explicit `generation` settings override "
+                               "the checkpoint's generation_config defaults",
+        "bos": bos,
+    })
+    return m
 
 
 # =========================================================
@@ -824,200 +718,241 @@ def load_backend(checkpoint, quant="bf16", device_map="auto",
 # =========================================================
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--dataset", action="append", choices=list(eb.DATASETS))
-    ap.add_argument("--hf-checkpoint", default=None,
-                    help="local path to Llama-4-Scout weights exposing hidden states")
-    ap.add_argument("--pooling", default="mean", choices=["mean", "last"])
-    ap.add_argument("--pca-k", action="append", type=int,
-                    help="repeatable; 0 = unaltered (always included, primary). "
-                         "k is bounded by the centred rank of the stimulus set, "
-                         "min(n_vectors - 1, hidden_dim), and never truncated")
-    ap.add_argument("--out", default=OUT_DIR)
-    ap.add_argument("--quant", default="bf16", choices=list(QUANTISATIONS),
-                    help="bf16 (default; the checkpoint's own dtype, offloaded "
-                         "across VRAM + RAM + disk). 4bit/8bit shrink nn.Linear "
-                         "ONLY, which on a Llama-4 MoE is ~11%% of the weights, "
-                         "and cannot be offloaded; see parameter_footprint()")
-    ap.add_argument("--device-map", default="auto")
-    ap.add_argument("--offload-folder", default=None,
-                    help="directory for weights that fit in neither VRAM nor "
-                         "RAM; put it on the FASTEST disk available, since it "
-                         "is re-read on every forward pass")
-    ap.add_argument("--gpu-reserve-gib", type=float, default=4.0,
-                    help="VRAM held back per GPU for activations (default 4)")
-    ap.add_argument("--cpu-reserve-gib", type=float, default=8.0,
-                    help="host RAM held back for the process and OS (default 8)")
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
+    ap.add_argument("--checkpoint", default=CHECKPOINT)
+    ap.add_argument("--stimuli", default=lh.STIMULI_CSV)
+    ap.add_argument("--prompts", default=lh.PROMPTS_CSV)
+    ap.add_argument("--out-dir", default=OUT_DIR)
+    ap.add_argument("--seed", type=int, default=lh.SEED_BASE,
+                    help="base generation seed; per-prompt seeds derive from it")
+    ap.add_argument("--max-new-tokens", type=int,
+                    default=lh.GENERATION["max_new_tokens"])
+    ap.add_argument("--domain", choices=("gender", "fab", "both"), default="both")
     ap.add_argument("--limit", type=int, default=None,
-                    help="SMOKE MODE: process at most N sessions per dataset, "
-                         "write nothing unless --force-write-smoke")
-    ap.add_argument("--force-write-smoke", action="store_true",
-                    help="allow a --limit run to write output files")
-    ap.add_argument("--all-arms", action="store_true",
-                    help="run every defined arm, not just the reported scope")
-    ap.add_argument("--preflight", action="store_true",
-                    help="report backend availability and exit")
+                    help="cap the number of prompts (diagnostics only)")
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="validate the frozen design; load no model")
+    ap.add_argument("--smoke-test", action="store_true",
+                    help="one gender + one FAB prompt, full diagnostics, "
+                         "writes nothing")
     args = ap.parse_args()
 
-    info = preflight(args.hf_checkpoint)
-    print(json.dumps(info, indent=2))
+    partial = bool(args.limit) or args.domain != "both" or args.smoke_test
+    stim, all_prompts = lh.load_design(
+        args.stimuli, args.prompts,
+        expect_total=None if partial else lh.N_TOTAL)
+    design = lh.design_summary(all_prompts, args.stimuli, args.prompts)
 
-    if not info["can_run_forward_pass"]:
-        print()
-        print("=" * 78)
-        print("MODEL-INTERNAL ANALYSIS NOT POSSIBLE WITH THE CURRENT SCOUT INTERFACE")
-        print("=" * 78)
-        for b in info["blockers"]:
-            print(f"  - {b}")
-        print()
-        print("The Scout behavioural sessions were collected through Ollama, which\n"
-              "returns generated text only; it has no per-layer hidden-state output.\n"
-              "This module will not substitute an API embedding or a different model\n"
-              "for Scout's internal representations, so it stops here.\n"
-              "To proceed, serve Llama-4-Scout through an interface that returns\n"
-              "output_hidden_states=True and pass --hf-checkpoint.")
-        raise SystemExit(2)
+    print(f"Fixed-prompt Bai-style WAT — Llama-4-Scout  "
+          f"(analysis {ANALYSIS_VERSION})")
+    print(f"  stimuli    : {args.stimuli}")
+    print(f"  prompts    : {args.prompts}  ({len(all_prompts)} frozen prompts)")
+    for cond, n in design["n_by_condition"].items():
+        print(f"    {cond:<20} {n}")
+    print(f"  checkpoint : {args.checkpoint}")
+    print(f"  generation : "
+          f"{dict(lh.GENERATION, max_new_tokens=args.max_new_tokens)}")
+    print(f"  seed base  : {args.seed}")
 
-    if args.preflight:
+    prompts = all_prompts
+    if args.domain != "both":
+        prompts = [r for r in prompts if r["domain"] == args.domain]
+    if args.smoke_test:
+        gender = next((r for r in prompts if r["domain"] == "gender"), None)
+        fab = next((r for r in prompts if r["domain"] == "fab"), None)
+        prompts = [r for r in (gender, fab) if r is not None]
+    elif args.limit:
+        prompts = prompts[:args.limit]
+
+    # role resolution needs no GPU — do it for every prompt before loading Scout
+    for record in prompts:
+        lh.prompt_roles(record, stim)
+    print(f"  roles resolved for all {len(prompts)} prompts "
+          f"(X/Y/A/B from stimuli.csv, not group0/group1)")
+
+    if args.dry_run:
+        print("\n--dry-run: design validated, no model loaded, nothing written.")
         return
 
-    # --- forward-pass path (requires a hidden-state backend; see docstring) ---
-    tok, model, backend = load_backend(args.hf_checkpoint, quant=args.quant,
-                                       device_map=args.device_map,
-                                       offload_folder=args.offload_folder,
-                                       gpu_reserve_gib=args.gpu_reserve_gib,
-                                       cpu_reserve_gib=args.cpu_reserve_gib)
-    print(f"  loaded {backend['loaded_with']} ({backend['quantisation']}), "
-          f"transformers {backend['transformers']}")
+    import torch, transformers
+    model, tok, backend = load_scout(args.checkpoint)
+    device = torch.device(backend["input_device"])
+    architecture = dict(n_transformer_blocks=backend["n_transformer_blocks"],
+                        hidden_size=backend["hidden_size"])
+    print(f"\n  loaded {backend['model_class']} in {backend['load_seconds']}s "
+          f"on {backend['device']}  ({backend['dtype']}, "
+          f"{backend['quantisation']}, {backend['attn_implementation']})")
+    print(f"  inputs -> {device} ({backend['input_embedding_module']})")
 
-    ks = sorted(set([0] + list(args.pca_k or [])))
-    trial_rows, null_rows, arch = [], [], None
-    systems, n_span_errors = {}, 0
-    os.makedirs(args.out, exist_ok=True)
+    if args.smoke_test:
+        return smoke_test(args, stim, prompts, all_prompts, model, tok,
+                          backend, device, architecture)
 
-    for name in (args.dataset or list(eb.DATASETS)):
-        spec = eb.DATASETS[name]
-        all_arms = spec["arms"]()
-        arms = all_arms if args.all_arms else eb.scoped(name, all_arms)
-        sessions = [r for r in eb.load_sessions(spec)
-                    if r.get("model") in SCOUT_BEHAVIOURAL_MODELS]
-        if args.limit:
-            sessions = sessions[:args.limit]
-        system = system_prompt_for(name)
-        systems[name] = system
-        print(f"[{name}] {len(sessions)} Scout sessions, arms: {sorted(arms)}"
-              + (f"  [SMOKE: limited to {args.limit}]" if args.limit else ""))
-        for i, r in enumerate(sessions, 1):
-            # the EXACT input the model saw: runner system message + user prompt,
-            # through the model's own chat template
-            prompt, user_window = build_chat_input(tok, system, r["prompt"])
-            x, y = spec["session_X"](r), spec["session_Y"](r)
-            for arm_name in spec["session_arms"](r, arms):
-                arm = arms[arm_name]
-                d = eb.session_D(r, spec, arm)
-                if d is None:
-                    continue
-                phrases = [x, y] + list(arm["A"]) + list(arm["B"])
-                try:
-                    vecs, arch = extract_prompt_hidden_states(
-                        prompt, phrases, tok, model, pooling=args.pooling,
-                        default_window=user_window,
-                        # every stimulus THIS prompt lists -- sorted items AND
-                        # the two target words -- so that a stimulus which is a
-                        # substring of another ('history' inside 'art history',
-                        # 'male' inside 'female', 'man' inside 'woman') is not
-                        # located inside it
-                        competitors=set(eb._assigned_items(r)) | {x, y})
-                except SpanError as exc:
-                    n_span_errors += 1
-                    raise SpanError(
-                        f"[{name} trial {r.get('trial')} arm {arm_name}] {exc}"
-                    ) from exc
-                if i == 1:
-                    print(f"  first trial: {arch['n_prompt_tokens']} tokens, "
-                          f"{arch['n_hidden_states']} hidden states, "
-                          f"hidden_size {arch['hidden_size']}")
-                for row in trial_layer_rows(
-                        vecs, arm, x, y, d, n_layers=arch["n_hidden_states"],
-                        ks=ks, pooling=args.pooling,
-                        base=dict(dataset=name, arm=arm_name,
-                                  behavioural_model=r.get("model"),
-                                  trial=r.get("trial"),
-                                  session_id=f"{os.path.basename(r['_file'])}"
-                                             f"#{r.get('trial')}",
-                                  checkpoint=args.hf_checkpoint)):
-                    (trial_rows if row["pca_k"] == 0 else null_rows).append(row)
-            if i % 25 == 0:
-                print(f"  [{name}] {i}/{len(sessions)} sessions")
+    acc = lh.PrototypeAccumulator()
+    rows, failures, meta = run_prompts(prompts, stim, model, tok, args=args,
+                                       device=device, architecture=architecture,
+                                       acc=acc)
+    n_hidden = meta["n_hidden_states"]
+    print(f"\n  {len(rows)} prompts in {meta['total_seconds']/60:.1f} min; "
+          f"{len(failures)} behavioural parse failure(s)")
 
-    agg = aggregate_pairs(trial_rows)
-    corr = layer_correlations(agg, checkpoint=args.hf_checkpoint,
-                              pooling=args.pooling, k=0)
-    for k in [k for k in ks if k]:
-        corr += layer_correlations(aggregate_pairs([r for r in null_rows
-                                                    if r["pca_k"] == k]),
-                                   checkpoint=args.hf_checkpoint,
-                                   pooling=args.pooling, k=k)
+    set_rows, stim_rows, missing = secondary_rows(acc, prompts, stim, n_hidden)
 
-    if args.limit and not args.force_write_smoke:
-        print(f"\nSMOKE RUN (--limit {args.limit}) — nothing written. "
-              f"{len(trial_rows)} trial-layer rows, {len(agg)} aggregated, "
-              f"{len(corr)} correlations would be produced. "
-              f"Pass --force-write-smoke to write them anyway.")
-        return
+    os.makedirs(args.out_dir, exist_ok=True)
+    lh.write_primary_csv(os.path.join(args.out_dir, lh.PRIMARY_CSV), rows,
+                         n_hidden, force=args.force)
+    eb.write_csv(os.path.join(args.out_dir, "behaviour_parse_failures.csv"),
+                 failures, args.force)
+    eb.write_csv(os.path.join(args.out_dir, "secondary_set_level_weat.csv"),
+                 set_rows, args.force)
+    eb.write_csv(os.path.join(args.out_dir, "secondary_stimulus_layer.csv"),
+                 stim_rows, args.force)
 
-    def _write(fname, rows):
-        path = os.path.join(args.out, fname)
-        if os.path.exists(path) and not args.force:
-            raise SystemExit(f"refusing to overwrite {path} — rerun with --force")
-        if not rows:
-            return
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=list(rows[0]))
-            w.writeheader(); w.writerows(rows)
-        print(f"  wrote {path} ({len(rows)} rows)")
+    import numpy as np
+    np.savez_compressed(
+        os.path.join(args.out_dir, "secondary_stimulus_prototypes.npz"),
+        **{f"{d}|{a}|{s}": acc.prototype(d, a, s) for (d, a, s) in acc.sums})
 
-    _write("hidden_trial_layer.csv", trial_rows)
-    _write("hidden_pair_layer_aggregated.csv", agg)
-    _write("hidden_layer_correlations.csv", corr)
-    _write("hidden_nullified_layer.csv", null_rows)
-    with open(os.path.join(args.out, "hidden_manifest.json"), "w",
+    first, _ = build_chat_input(tok, lh.SYSTEM_PROMPT, prompts[0]["prompt"])
+    manifest = build_manifest(
+        backend=backend,
+        arch=dict(transformers_version=transformers.__version__,
+                  torch_version=torch.__version__),
+        design=design, n_hidden_states=n_hidden, parse_failures=failures,
+        generation=dict(lh.GENERATION, max_new_tokens=args.max_new_tokens),
+        missing=missing, args=args, bos=bos_record(tok, first))
+    with open(os.path.join(args.out_dir, "manifest.json"), "w",
               encoding="utf-8") as f:
-        json.dump(dict(
-            analysis="model-internal hidden states (Scout only)",
-            analysis_version=ANALYSIS_VERSION,
-            generated_utc=datetime.now(timezone.utc).isoformat(),
-            checkpoint=args.hf_checkpoint, architecture=arch,
-            backend=backend,
-            model_input=dict(
-                source="the saved behavioural prompt, re-templated",
-                chat_template="tokenizer.apply_chat_template(system + user, "
-                              "add_generation_prompt=True)",
-                system_prompt=systems,
-                span_lookup="restricted to the user-message window inside the "
-                            "templated text",
-                response_embedded=False),
-            scope=("all defined arms (--all-arms)" if args.all_arms
-                   else "reported scope (see embed_bias.IN_SCOPE)"),
-            limit=args.limit,
-            token_pooling=args.pooling, pca_k_values=ks,
-            pca_method="Bai-inspired exploratory all-but-the-top-style PC "
-                       "removal (Mu, Bhat & Viswanath 2018); NOT a reproduction "
-                       "of Bai's pca.py, which re-adds the mean "
-                       "(add_mean_back=True is the optional compatibility mode). "
-                       "Nullification is not debiasing.",
-            pca_fit_on="the stimulus vectors of that trial and layer: the two "
-                       "target phrases plus every attribute phrase of the arm",
-            pca_max_k="min(n_stimulus_vectors - 1, hidden_dim) — the centred rank",
-            primary="pca_k=0 (unaltered)",
-            statistics=dict(primary="spearman", secondary="pearson",
-                            level="unique target pairs per layer"),
-            datasets=args.dataset or list(eb.DATASETS),
-            counts=dict(trial_layer=len(trial_rows), aggregated=len(agg),
-                        correlations=len(corr), nullified=len(null_rows)),
-        ), f, indent=2)
+        json.dump(manifest, f, indent=2, default=str)
+    print(f"  wrote {os.path.join(args.out_dir, 'manifest.json')}")
+
+
+def validate_all_spans(tokenizer, prompts, stim):
+    """
+    Tokenizer-only: every stimulus of every prompt resolves to exactly one span
+    under THIS tokenizer.  Returns (min tokens, max tokens, {leading BOS}).
+    """
+    n_tok, n_bos = [], set()
+    for record in prompts:
+        roles = lh.prompt_roles(record, stim)
+        templated, window = build_chat_input(tokenizer, lh.SYSTEM_PROMPT,
+                                             record["prompt"])
+        enc = tokenizer(templated, return_offsets_mapping=True)
+        for phrase in roles["phrases"]:
+            resolve_span(templated, enc["offset_mapping"], phrase, window=window,
+                         competitors=[c for c in roles["phrases"] if c != phrase])
+        n_tok.append(len(enc["input_ids"]))
+        n_bos.add(leading_bos_count(tokenizer, templated))
+    return min(n_tok), max(n_tok), sorted(n_bos)
+
+
+def smoke_test(args, stim, prompts, all_prompts, model, tokenizer, backend,
+               device, architecture):
+    """One gender + one FAB prompt, every diagnostic, nothing written."""
+    import torch
+
+    def rule(t):
+        print(f"\n{'='*74}\n{t}\n{'='*74}", flush=True)
+
+    GIB = float(1 << 30)
+    gpus = [torch.device(d) for d in backend["devices"]]
+    for g in gpus:
+        free, total = torch.cuda.mem_get_info(g)
+        print(f"  {g} after load : {(total-free)/GIB:.2f} GiB used, "
+              f"{free/GIB:.2f} GiB free")
+    print(f"  text_config        : {architecture['n_transformer_blocks']} "
+          f"blocks, hidden {architecture['hidden_size']}, "
+          f"{backend['num_local_experts']} experts "
+          f"(top-{backend['num_experts_per_tok']})")
+    lo, hi, n_bos = validate_all_spans(tokenizer, all_prompts, stim)
+    print(f"  spans              : every stimulus of all {len(all_prompts)} "
+          f"prompts resolves once; {lo}..{hi} tokens; leading BOS {n_bos}")
+
+    for record in prompts:
+        roles = lh.prompt_roles(record, stim)
+        rule(f"SMOKE — {record['prompt_id']}  ({record['domain']}/"
+             f"{record['category']}, trial {record['trial']})")
+        print(f"  presented order      : group0={record['group0']!r}  "
+              f"group1={record['group1']!r}")
+        print(f"  roles from stimuli   : X={roles['X']!r} ({roles['arm']['X_name']})"
+              f"  Y={roles['Y']!r} ({roles['arm']['Y_name']})")
+        print(f"  A ({roles['arm']['A_name']}): {roles['A']}")
+        print(f"  B ({roles['arm']['B_name']}): {roles['B']}")
+        print(f"  presented order of items: {roles['attributes']}")
+        print(f"\n  prompt:\n    {record['prompt']}")
+
+        templated, window = build_chat_input(tokenizer, lh.SYSTEM_PROMPT,
+                                             record["prompt"])
+        n_tok = len(tokenizer(templated)["input_ids"])
+        bos = bos_record(tokenizer, templated)
+        print(f"\n  system prompt        : {lh.SYSTEM_PROMPT!r}")
+        print(f"  chat-template tokens : {n_tok}   BOS in template "
+              f"{bos['bos_in_templated_text']}, in model input "
+              f"{bos['bos_in_model_input']}")
+
+        seed = lh.prompt_seed(record["prompt_id"], args.seed)
+        response, gen_meta = generate_response(
+            templated, tokenizer, model, seed=seed, device=device,
+            generation=dict(lh.GENERATION, max_new_tokens=args.max_new_tokens))
+        print(f"\n  generation           : seed={seed} "
+              f"temp={gen_meta['temperature']} do_sample={gen_meta['do_sample']} "
+              f"new_tokens={gen_meta['n_new_tokens']} "
+              f"({gen_meta['generate_seconds']:.1f}s)")
+        print("  response:")
+        for line in response.splitlines():
+            print(f"    {line}")
+
+        vectors, meta = extract_prompt_vectors(
+            templated, roles["phrases"], tokenizer, model, device=device,
+            architecture=architecture, user_window=window,
+            competitors=roles["phrases"], context=record["prompt_id"])
+        print(f"\n  hidden states        : {meta['n_hidden_states']} "
+              f"(= 1 input embedding + {meta['n_transformer_blocks']} blocks), "
+              f"dim {meta['hidden_size']}  — matches text_config")
+        print(f"  prompt tokens        : {meta['n_prompt_tokens']}   "
+              f"forward {meta['forward_seconds']:.2f}s   "
+              f"finite check {meta['finite_check']}")
+        print(f"  pooling              : {meta['pooling']} over every sub-token")
+        for phrase in roles["phrases"]:
+            lo, hi = meta["spans"][phrase]
+            print(f"    {phrase:<26} tokens [{lo}, {hi})  "
+                  f"{meta['subtokens'][phrase]}")
+
+        assign, problems = lh.parse_behaviour(response, record, roles)
+        if problems:
+            score, denom = float("nan"), None
+            print(f"\n  behavioural parse    : FAILED — {' | '.join(problems)}")
+            print("  (representation columns are kept; behaviour_wat_score = NaN)")
+        else:
+            score, denom = lh.behaviour_wat_score(assign, record, roles)
+            print(f"\n  behavioural parse    : all "
+                  f"{len(roles['attributes'])} items assigned")
+            if denom is None:
+                print(f"  behaviour_wat_score  : {score:+.4f}  "
+                      f"(positive = stereotype-congruent)")
+            else:
+                print(f"  behaviour_wat_score  : NaN — {denom}")
+
+        deltas, weats = lh.representation_scores(vectors, roles,
+                                                 meta["n_hidden_states"])
+        last = meta["n_hidden_states"] - 1
+        mid = last // 2
+        print(f"\n  layer0  (input embedding) delta={deltas[0]:+.5f}  "
+              f"weat={weats[0]:+.4f}")
+        print(f"  layer1  (block 1)         delta={deltas[1]:+.5f}  "
+              f"weat={weats[1]:+.4f}")
+        print(f"  layer{mid:<2} (block {mid})        delta={deltas[mid]:+.5f}  "
+              f"weat={weats[mid]:+.4f}")
+        print(f"  layer{last:<2} (block {last})       delta={deltas[last]:+.5f}  "
+              f"weat={weats[last]:+.4f}")
+        print(f"  non-finite values    : "
+              f"{sum(1 for v in deltas + weats if v != v)}")
+        for g in gpus:
+            print(f"  {g} peak allocated : "
+                  f"{torch.cuda.max_memory_allocated(g)/GIB:.2f} GiB")
+
+    rule("SMOKE TEST COMPLETE — nothing written")
 
 
 if __name__ == "__main__":
