@@ -6,8 +6,9 @@ WHAT THIS IS, AND WHAT IT IS NOT
     reference space — a convergent representational check on our behavioural
     WATs.  They are NOT the internal representation of GPT, Claude, Gemini or
     Scout, and nothing here explains why any proprietary model behaved as it
-    did.  Model-internal analysis is a separate concern and a separate file
-    (`embed_bias_scout_hidden.py`); the two never share a code path.
+    did.  Model-internal analysis is a separate concern and separate modules
+    (`embedding/wat_hidden.py`, `embedding/chained_hidden.py`); the two share
+    only the WEAT / statistics helpers in `embedding/core.py`.
 
 METHODOLOGICAL REFERENCE
     Bai et al. (2025), SI section O — `ref/llm-implicit-bias/additional/`,
@@ -95,18 +96,14 @@ OUTPUTS  (responses/embed/, tidy CSVs + manifest; existing files are never
     embedding_manifest.json
 
 USAGE
-    python3 embedding/embed_bias.py --dry-run                 # inventory, no API calls
-    python3 embedding/embed_bias.py --offline                 # cache only, no API calls
-    python3 embedding/embed_bias.py --emb-model text-embedding-3-large --context both
+    python -m embedding.external_embedding --dry-run                 # inventory, no API calls
+    python -m embedding.external_embedding --offline                 # cache only, no API calls
+    python -m embedding.external_embedding --emb-model text-embedding-3-large --context both
 """
 
 import os
-import sys
-import csv
 import json
-import math
 import argparse
-import itertools
 from collections import defaultdict
 from datetime import datetime, timezone
 
@@ -133,12 +130,14 @@ except ImportError:                 # python-dotenv is not installed everywhere
 # This module lives in <project>/embedding/ but reads the behavioural runners and
 # the response trees from the project root, so anchor everything there rather
 # than on the current working directory.
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
-
+from embedding import ROOT
 import wat_fab
 import wat_gender_brilliance as wgb
+# The WEAT / WEFAT and statistics helpers are shared with the hidden-state
+# experiments and live in embedding.core (moved there verbatim).
+from embedding.core import (_scipy_stats, weat_test_stat, weat_effect_size,
+                            bai_singleton_weat, weat_p_value, wefat_score,
+                            pearson, spearman, apply_holm, write_csv)
 
 load_dotenv(os.path.join(ROOT, ".env"), override=True)
 
@@ -148,7 +147,6 @@ ANALYSIS_VERSION = "2.3"          # 2.2 = reported arm scope (gb 4 controls, fab
                                   # 1.x = pre-spec version (rb + pooled item r)
 OUT_DIR = os.path.join(ROOT, "responses", "embed")
 DEFAULT_EMB_MODEL = "text-embedding-3-small"
-PERM_CAP = 200_000                # exact permutation test below this many splits
 
 OUTPUT_FILES = [
     "set_level.csv", "fab_field_wefat.csv", "fab_field_correlations.csv",
@@ -180,272 +178,6 @@ def contextualise(word, kind, context):
     if context == "bare":
         return word
     return (TARGET_CTX if kind == "target" else ATTRIBUTE_CTX).format(w=word)
-
-
-# =========================================================
-# WEAT / WEFAT  (Caliskan et al. 2017)
-# =========================================================
-
-def _unit(v):
-    import numpy as np
-    return v / np.linalg.norm(v, axis=-1, keepdims=True)
-
-
-def cos_sim(v1, v2):
-    import numpy as np
-    return np.matmul(_unit(np.asarray(v1, dtype=float)),
-                     _unit(np.asarray(v2, dtype=float)).T)
-
-
-def weat_association(W, A, B):
-    """s(w, A, B) = mean cos(w, A) - mean cos(w, B), for every w in W."""
-    import numpy as np
-    return np.mean(cos_sim(W, A), axis=-1) - np.mean(cos_sim(W, B), axis=-1)
-
-
-def weat_test_stat(X, Y, A, B):
-    """S(X,Y,A,B) = sum_x s(x,A,B) - sum_y s(y,A,B)  (unstandardised)."""
-    import numpy as np
-    return float(np.sum(weat_association(X, A, B)) - np.sum(weat_association(Y, A, B)))
-
-
-def weat_effect_size(X, Y, A, B):
-    """
-    Caliskan's d = [mean s(X) - mean s(Y)] / SD(s(X u Y)).
-    Degenerate when len(X) == len(Y) == 1 (SD of two values) — callers flag it.
-    """
-    import numpy as np
-    sx = weat_association(X, A, B)
-    sy = weat_association(Y, A, B)
-    sd = np.std(np.concatenate((sx, sy), axis=0), ddof=1)
-    if sd == 0 or not np.isfinite(sd):
-        return float("nan")
-    return float((np.mean(sx) - np.mean(sy)) / sd)
-
-
-def bai_singleton_weat(X, Y, A, B):
-    """
-    Bai's standardized score as literally implemented (population SD + eps=0.001).
-    Supplemental only: with one X and one Y it collapses toward +-2 regardless of
-    the magnitude of the underlying association.
-    """
-    import numpy as np
-    sx = weat_association(X, A, B)
-    sy = weat_association(Y, A, B)
-    sd = np.std(np.concatenate((sx, sy), axis=0))
-    return float((np.mean(sx) - np.mean(sy)) / (sd + 0.001))
-
-
-def weat_p_value(X, Y, A, B, cap=PERM_CAP, seed=0):
-    """
-    Two-sided exact permutation p over equal-size splits of X u Y.
-    Seeded random subsample past `cap` splits.  Returns (p, n_perms, exact).
-    nan when len(X) != len(Y) (no equal-size partition exists).
-    """
-    import numpy as np
-    X = np.asarray(X, dtype=float); Y = np.asarray(Y, dtype=float)
-    if len(X) != len(Y):
-        return float("nan"), 0, False
-    pool = np.concatenate((X, Y), axis=0)
-    n, k = len(pool), len(X)
-    observed = weat_test_stat(X, Y, A, B)
-    total = math.comb(n, k)
-    if total <= cap:
-        splits = itertools.combinations(range(n), k)
-        exact = True
-    else:
-        rng = np.random.default_rng(seed)
-        splits = (tuple(rng.choice(n, k, replace=False)) for _ in range(cap))
-        exact = False
-    count = tot = 0
-    for idx in splits:
-        mask = np.zeros(n, dtype=bool); mask[list(idx)] = True
-        if abs(weat_test_stat(pool[mask], pool[~mask], A, B)) >= abs(observed) - 1e-12:
-            count += 1
-        tot += 1
-    return count / tot, tot, exact
-
-
-def wefat_score(w, A, B):
-    """
-    WEFAT: where ONE item sits on the A<->B dimension, normalised by the SD of
-    its own cosines.  Positive = closer to A.  `w` is a single vector.
-    """
-    import numpy as np
-    w = np.asarray(w, dtype=float)[None, :]
-    num = weat_association(w, A, B)[0]
-    sd = np.std(np.concatenate((cos_sim(w, A).ravel(), cos_sim(w, B).ravel())), ddof=1)
-    return float(num / sd) if sd else float("nan")
-
-
-# =========================================================
-# Statistics — Spearman (primary) and Pearson (secondary), scipy-free fallback
-# =========================================================
-
-try:                                     # scipy is NOT installed in this env;
-    from scipy import stats as _scipy_stats   # the fallback below is the real path
-except Exception:
-    _scipy_stats = None
-
-
-def _betacf(a, b, x, itmax=300, eps=3e-16):
-    """Continued fraction for the incomplete beta (Numerical Recipes 6.4)."""
-    tiny = 1e-300
-    qab, qap, qam = a + b, a + 1.0, a - 1.0
-    c, d = 1.0, 1.0 - qab * x / qap
-    if abs(d) < tiny:
-        d = tiny
-    d = 1.0 / d
-    h = d
-    for m in range(1, itmax + 1):
-        m2 = 2 * m
-        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
-        d = 1.0 + aa * d
-        if abs(d) < tiny:
-            d = tiny
-        c = 1.0 + aa / c
-        if abs(c) < tiny:
-            c = tiny
-        d = 1.0 / d
-        h *= d * c
-        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
-        d = 1.0 + aa * d
-        if abs(d) < tiny:
-            d = tiny
-        c = 1.0 + aa / c
-        if abs(c) < tiny:
-            c = tiny
-        d = 1.0 / d
-        de = d * c
-        h *= de
-        if abs(de - 1.0) < eps:
-            break
-    return h
-
-
-def _betai(a, b, x):
-    """Regularised incomplete beta I_x(a, b)."""
-    if x <= 0:
-        return 0.0
-    if x >= 1:
-        return 1.0
-    bt = math.exp(math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
-                  + a * math.log(x) + b * math.log1p(-x))
-    if x < (a + 1.0) / (a + b + 2.0):
-        return bt * _betacf(a, b, x) / a
-    return 1.0 - bt * _betacf(b, a, 1.0 - x) / b
-
-
-def t_sf2(t, df):
-    """Two-sided Student-t p-value."""
-    if df <= 0 or not math.isfinite(t):
-        return float("nan")
-    return _betai(df / 2.0, 0.5, df / (df + t * t))
-
-
-def _clean_pairs(xs, ys):
-    import numpy as np
-    x = np.asarray(xs, dtype=float); y = np.asarray(ys, dtype=float)
-    ok = np.isfinite(x) & np.isfinite(y)
-    return x[ok], y[ok]
-
-
-def pearson(xs, ys):
-    """(r, p, n).  p from the t approximation on n-2 df."""
-    x, y = _clean_pairs(xs, ys)
-    n = len(x)
-    if n < 3 or x.std() == 0 or y.std() == 0:
-        return float("nan"), float("nan"), n
-    import numpy as np
-    r = max(-1.0, min(1.0, float(np.corrcoef(x, y)[0, 1])))
-    if abs(r) >= 1.0:
-        return r, 0.0, n
-    return r, t_sf2(r * math.sqrt((n - 2) / (1 - r * r)), n - 2), n
-
-
-def rankdata(values):
-    """Ranks with ties averaged (scipy.stats.rankdata 'average')."""
-    import numpy as np
-    v = np.asarray(values, dtype=float)
-    order = np.argsort(v, kind="mergesort")
-    ranks = np.empty(len(v), dtype=float)
-    i = 0
-    while i < len(v):
-        j = i
-        while j + 1 < len(v) and v[order[j + 1]] == v[order[i]]:
-            j += 1
-        ranks[order[i:j + 1]] = (i + j) / 2.0 + 1.0
-        i = j + 1
-    return ranks
-
-
-def spearman(xs, ys):
-    """
-    (rho, p, n).  Pearson on tie-averaged ranks; p from the t approximation,
-    which is what scipy uses by default for n > 3 as well.  PRIMARY statistic.
-    """
-    x, y = _clean_pairs(xs, ys)
-    if len(x) < 3:
-        return float("nan"), float("nan"), len(x)
-    if _scipy_stats is not None:
-        res = _scipy_stats.spearmanr(x, y)
-        return float(res.statistic), float(res.pvalue), len(x)
-    return pearson(rankdata(x), rankdata(y))
-
-
-def holm(pvalues):
-    """
-    Holm-Bonferroni step-down adjusted p-values, in the INPUT order.
-
-    Finite p-values are corrected among themselves; missing / non-finite entries
-    stay missing and do not count towards the family size.  The result is
-    monotone in the sorted p-values and capped at 1.  Raw p-values are never
-    replaced -- the caller stores both.
-    """
-    def _finite(v):
-        try:
-            v = float(v)
-        except (TypeError, ValueError):
-            return None
-        return v if math.isfinite(v) else None
-
-    vals = [_finite(v) for v in pvalues]
-    idx = [i for i, v in enumerate(vals) if v is not None]
-    out = [float("nan")] * len(vals)
-    m = len(idx)
-    running = 0.0
-    for rank, i in enumerate(sorted(idx, key=lambda j: vals[j])):
-        running = max(running, (m - rank) * vals[i])
-        out[i] = min(1.0, running)
-    return out
-
-
-def apply_holm(rows, key_of, label_of, p_key, out_key):
-    """
-    Holm-correct `p_key` within each family and write `out_key` + `holm_family`
-    + `holm_n` onto every row.  Rows for which `key_of` returns None are left
-    uncorrected (descriptive rows) with blank family fields.
-
-    The grouping key may be finer than the printed family label: families are
-    always formed within one embedding model and one contextualisation, which
-    the label omits because those are separate columns.
-    """
-    fams = defaultdict(list)
-    for r in rows:
-        key = key_of(r)
-        if key is None:
-            r.setdefault(out_key, "")
-            r.setdefault("holm_family", "")
-            r.setdefault("holm_n", "")
-            continue
-        fams[key].append(r)
-    for key, rs in fams.items():
-        adj = holm([r.get(p_key) for r in rs])
-        n_tested = sum(1 for a in adj if a == a)
-        for r, a in zip(rs, adj):
-            r[out_key] = a
-            r["holm_family"] = label_of(rs[0])
-            r["holm_n"] = n_tested
 
 
 def corr_record(level, dataset, arm, model, xs, ys, *, emb_model, context,
@@ -958,24 +690,6 @@ def run_pair_level(name, spec, arms, emb, sessions, raw_rows, agg_rows, corr_row
 # =========================================================
 # Output
 # =========================================================
-
-def write_csv(path, rows, force):
-    if not rows:
-        print(f"  (no rows for {os.path.basename(path)} — not written)")
-        return
-    if os.path.exists(path) and not force:
-        raise SystemExit(f"refusing to overwrite {path} — rerun with --force "
-                         f"(nothing written this run)")
-    keys = []
-    for r in rows:                       # union of keys, first-seen order
-        for k in r:
-            if k not in keys:
-                keys.append(k)
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=keys)
-        w.writeheader()
-        w.writerows(rows)
-    print(f"  wrote {path}  ({len(rows)} rows)")
 
 
 def star(p):

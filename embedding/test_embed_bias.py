@@ -8,9 +8,11 @@ No pytest in this environment, so this is a plain runner: every `test_*` functio
 either returns (pass) or raises (fail).  Nothing here touches the OpenAI API, the
 Ollama server, or any behavioural runner — the embedding client is faked.
 
-Sections 0-7, 11-13, 16 and 18 cover `embed_bias.py`.  Sections 8, 17 and 23
-cover the generic span layer that `embed_bias_scout_hidden.py` hosts for both
-fixed-prompt runners.  Section 24 covers the Scout fixed-prompt runner itself;
+Sections 0-7, 11-13, 16 and 18 cover `external_embedding.py` (and the shared
+WEAT / statistics helpers in `core.py`).  Sections 8, 17 and 23 cover the
+generic span layer in `core.py` that both backends use.  Section 24 covers the
+Scout backend through the model-agnostic `wat_hidden.py` runner, and the
+package architecture;
 the frozen design and the shared arithmetic are tested in full by
 `test_embed_bias_llama3.py`, whose fakes are reused here.  Nothing loads Scout's
 weights; one test reads the Scout TOKENIZER if the checkpoint is present.
@@ -28,10 +30,12 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import embed_bias as eb
-import embed_bias_scout_hidden as sc
-import embed_bias_llama3_hidden as lh
+from embedding import core, design, wat_hidden
+from embedding import external_embedding as ext
+from embedding.backends import llama_31, llama_scout
+from embedding.backends import openai as backend_openai
 import test_embed_bias_llama3 as tl          # fakes, frozen design, helpers
 import wat_fab
 import wat_gender_brilliance as wgb
@@ -77,24 +81,24 @@ def _axis_vectors(values, dim=3):
 def test_spearman_is_rank_based_and_matches_known_values():
     x = [1, 2, 3, 4, 5]
     y = [1, 4, 9, 16, 25]                     # monotone but not linear
-    rho, p, n = eb.spearman(x, y)
+    rho, p, n = core.spearman(x, y)
     assert abs(rho - 1.0) < 1e-12, rho
     assert n == 5
-    r, _, _ = eb.pearson(x, y)
+    r, _, _ = core.pearson(x, y)
     assert r < 0.99, f"Pearson should be below 1 on this curve, got {r}"
 
     # hand-checked against scipy.stats.spearmanr for a set with ties
-    rho2, _, _ = eb.spearman([1, 2, 2, 3], [10, 20, 30, 40])
+    rho2, _, _ = core.spearman([1, 2, 2, 3], [10, 20, 30, 40])
     assert abs(rho2 - 0.9486832980505138) < 1e-9, rho2
 
-    ranks = eb.rankdata([10, 20, 20, 30])
+    ranks = core.rankdata([10, 20, 20, 30])
     assert list(ranks) == [1.0, 2.5, 2.5, 4.0], ranks
 
 
 def test_t_pvalue_matches_numeric_integration():
     for t, df, expect in [(2.0, 10, 0.0733880), (3.5, 28, 0.0015765),
                           (0.5, 100, 0.6181736)]:
-        got = eb.t_sf2(t, df)
+        got = core.t_sf2(t, df)
         assert abs(got - expect) < 1e-6, (t, df, got, expect)
 
 
@@ -108,12 +112,12 @@ def test_weat_sign_convention_congruent_is_positive():
     Y = _axis_vectors([-0.9, -0.8, -0.85])
     A = _axis_vectors([1.0, 0.95])             # 'brilliance' / 'high-FAB' side
     B = _axis_vectors([-1.0, -0.95])
-    assert eb.weat_test_stat(X, Y, A, B) > 0
-    assert eb.weat_effect_size(X, Y, A, B) > 0
+    assert core.weat_test_stat(X, Y, A, B) > 0
+    assert core.weat_effect_size(X, Y, A, B) > 0
     # and the incongruent configuration flips
-    assert eb.weat_effect_size(Y, X, A, B) < 0
+    assert core.weat_effect_size(Y, X, A, B) < 0
 
-    p, n, exact = eb.weat_p_value(X, Y, A, B)
+    p, n, exact = core.weat_p_value(X, Y, A, B)
     assert exact and n == math.comb(6, 3)
     assert p < 0.2, p
 
@@ -121,8 +125,8 @@ def test_weat_sign_convention_congruent_is_positive():
 def test_weat_effect_size_is_scale_free_but_test_stat_is_not():
     X, Y = _axis_vectors([0.9, 0.8]), _axis_vectors([-0.9, -0.8])
     A, B = _axis_vectors([1.0, 0.9]), _axis_vectors([-1.0, -0.9])
-    big = eb.weat_test_stat(X, Y, A, B)
-    small = eb.weat_test_stat(_axis_vectors([0.2, 0.1]), _axis_vectors([-0.2, -0.1]),
+    big = core.weat_test_stat(X, Y, A, B)
+    small = core.weat_test_stat(_axis_vectors([0.2, 0.1]), _axis_vectors([-0.2, -0.1]),
                               A, B)
     assert big > small > 0, (big, small)
 
@@ -138,9 +142,9 @@ def test_wefat_orders_items_by_proximity_to_the_positive_pole():
     neutral = _axis_vectors([0.0])[0]
     near_effort = _axis_vectors([-0.9])[0]
 
-    hi = eb.wefat_score(near_brilliance, A, B)
-    mid = eb.wefat_score(neutral, A, B)
-    lo = eb.wefat_score(near_effort, A, B)
+    hi = core.wefat_score(near_brilliance, A, B)
+    mid = core.wefat_score(neutral, A, B)
+    lo = core.wefat_score(near_effort, A, B)
     assert hi > mid > lo, (hi, mid, lo)
     assert hi > 0 > lo
 
@@ -154,10 +158,10 @@ def test_singleton_standardized_score_saturates_but_delta_does_not():
     strong = (_axis_vectors([0.9]), _axis_vectors([-0.9]))
     weak = (_axis_vectors([0.05]), _axis_vectors([-0.05]))
 
-    s_sing = eb.bai_singleton_weat(*strong, A, B)
-    w_sing = eb.bai_singleton_weat(*weak, A, B)
-    s_delta = eb.weat_test_stat(*strong, A, B)
-    w_delta = eb.weat_test_stat(*weak, A, B)
+    s_sing = core.bai_singleton_weat(*strong, A, B)
+    w_sing = core.bai_singleton_weat(*weak, A, B)
+    s_delta = core.weat_test_stat(*strong, A, B)
+    w_delta = core.weat_test_stat(*weak, A, B)
 
     # Bai's standardized singleton score is pinned near +-2 whatever the magnitude
     assert 1.9 < abs(s_sing) <= 2.0 and 1.9 < abs(w_sing) <= 2.0, (s_sing, w_sing)
@@ -192,8 +196,8 @@ def _fab_sessions(pairs_with_repeats):
 
 
 def test_pair_level_n_is_unique_pairs_not_sessions():
-    spec = eb.DATASETS["fab"]
-    arms = {k: v for k, v in eb.fab_arms().items() if k == "leslie@tertile"}
+    spec = ext.DATASETS["fab"]
+    arms = {k: v for k, v in ext.fab_arms().items() if k == "leslie@tertile"}
     sessions = _fab_sessions([("innate gift", "hard work", 7),
                               ("raw ability", "motivation", 5),
                               ("innate talent", "dedication", 3)])
@@ -204,7 +208,7 @@ def test_pair_level_n_is_unique_pairs_not_sessions():
     emb = FakeEmbedder(scores)
 
     raw, agg, corr = [], [], []
-    eb.run_pair_level("fab", spec, arms, emb, sessions, raw, agg, corr)
+    ext.run_pair_level("fab", spec, arms, emb, sessions, raw, agg, corr)
 
     assert len(raw) == 15, len(raw)                 # one row per session
     assert len(agg) == 3, agg                       # one row per unique pair
@@ -222,12 +226,12 @@ def test_pair_level_n_is_unique_pairs_not_sessions():
 
 def test_pair_level_keeps_one_embedding_delta_per_pair():
     """Repeats of a pair must not contribute several embedding observations."""
-    spec = eb.DATASETS["fab"]
-    arms = {k: v for k, v in eb.fab_arms().items() if k == "leslie@tertile"}
+    spec = ext.DATASETS["fab"]
+    arms = {k: v for k, v in ext.fab_arms().items() if k == "leslie@tertile"}
     sessions = _fab_sessions([("innate gift", "hard work", 4)])
     emb = FakeEmbedder({w: 0.5 for w in wat_fab.BRILLIANCE_WORDS})
     raw, agg, corr = [], [], []
-    eb.run_pair_level("fab", spec, arms, emb, sessions, raw, agg, corr)
+    ext.run_pair_level("fab", spec, arms, emb, sessions, raw, agg, corr)
     assert len({round(r["delta"], 12) for r in raw}) == 1
     assert len(agg) == 1 and agg[0]["n_sessions"] == 4
 
@@ -247,7 +251,7 @@ def test_fab_has_exactly_the_thirty_leslie_fields_with_their_scores():
 
 
 def test_fab_wefat_table_is_continuous_over_all_thirty_fields():
-    spec = eb.DATASETS["fab"]
+    spec = ext.DATASETS["fab"]
     sessions = _fab_sessions([("innate gift", "hard work", 4)])
     scores = {f: wat_fab.FAB_SCORE[f] - 4.0 for f in wat_fab.FIELD_LABELS}
     for bri, eff in wat_fab.POLE_SETS.values():      # both pole sets, both arms
@@ -256,7 +260,7 @@ def test_fab_wefat_table_is_continuous_over_all_thirty_fields():
     emb = FakeEmbedder(scores)
 
     fields, corr = [], []
-    eb.run_fab_wefat(spec, emb, sessions, fields, corr)
+    ext.run_fab_wefat(spec, emb, sessions, fields, corr)
 
     leslie = [r for r in fields
               if r["pole_set"] == "leslie" and r["behavioural_model"] == "fake-llm"]
@@ -277,7 +281,7 @@ def test_fab_wefat_table_is_continuous_over_all_thirty_fields():
 
 
 def test_fab_model_correlations_are_reported_per_model_not_pooled():
-    spec = eb.DATASETS["fab"]
+    spec = ext.DATASETS["fab"]
     sessions = _fab_sessions([("innate gift", "hard work", 2)])
     for s in sessions[:1]:
         s["model"] = "model-a"
@@ -285,7 +289,7 @@ def test_fab_model_correlations_are_reported_per_model_not_pooled():
         s["model"] = "model-b"
     emb = FakeEmbedder({f: 0.1 for f in wat_fab.FIELD_LABELS})
     fields, corr = [], []
-    eb.run_fab_wefat(spec, emb, sessions, fields, corr)
+    ext.run_fab_wefat(spec, emb, sessions, fields, corr)
     per_model = [c for c in corr if c["level"] == "fab_field_wefat_vs_model_P"]
     models = {c["behavioural_model"] for c in per_model}
     assert models == {"model-a", "model-b"}, models
@@ -298,7 +302,7 @@ def test_fab_model_correlations_are_reported_per_model_not_pooled():
 # =========================================================
 
 def test_gb_arms_use_the_exact_runner_stimuli():
-    arms = eb.gb_arms()
+    arms = ext.gb_arms()
     assert set(arms) == set(wgb.CONTROL_SETS)
     for ctrl, arm in arms.items():
         bset, bwords = wgb.resolve_brilliance(ctrl)
@@ -313,7 +317,7 @@ def test_gb_arms_use_the_exact_runner_stimuli():
 
 
 def test_fab_arms_use_the_exact_runner_stimuli_and_both_splits():
-    arms = eb.fab_arms()
+    arms = ext.fab_arms()
     assert set(arms) == {"leslie@tertile", "leslie@median",
                          "bian@tertile", "bian@median"}
     for name, arm in arms.items():
@@ -327,18 +331,18 @@ def test_fab_arms_use_the_exact_runner_stimuli_and_both_splits():
 
 
 def test_behavioural_D_is_recomputed_from_raw_assignments():
-    spec = eb.DATASETS["fab"]
-    arm = eb.fab_arms()["leslie@tertile"]
+    spec = ext.DATASETS["fab"]
+    arm = ext.fab_arms()["leslie@tertile"]
     rec = dict(assignments={**{f: "brilliance" for f in arm["A"]},
                             **{f: "effort" for f in arm["B"]}},
                wat_D_fab_tertile=-999)          # a stored score that must be ignored
-    assert eb.session_D(rec, spec, arm) == 1.0
+    assert ext.session_D(rec, spec, arm) == 1.0
     rec2 = dict(assignments={**{f: "effort" for f in arm["A"]},
                              **{f: "brilliance" for f in arm["B"]}})
-    assert eb.session_D(rec2, spec, arm) == -1.0
+    assert ext.session_D(rec2, spec, arm) == -1.0
     # a JSON-string assignments blob (as some runners write it) parses identically
     rec3 = dict(assignments=json.dumps(rec["assignments"]))
-    assert eb.session_D(rec3, spec, arm) == 1.0
+    assert ext.session_D(rec3, spec, arm) == 1.0
 
 
 # =========================================================
@@ -346,9 +350,11 @@ def test_behavioural_D_is_recomputed_from_raw_assignments():
 # =========================================================
 
 def test_no_race_dataset_or_code_path():
-    assert set(eb.DATASETS) == {"fab", "gb"}
+    assert set(ext.DATASETS) == {"fab", "gb"}
     here = os.path.dirname(os.path.abspath(__file__))
-    for fname in ("embed_bias.py", "embed_bias_scout_hidden.py"):
+    for fname in ("external_embedding.py", "core.py", "design.py", "wat_hidden.py",
+                  "chained_hidden.py", "backends/llama_31.py",
+                  "backends/llama_scout.py", "backends/openai.py"):
         src = open(os.path.join(here, fname), encoding="utf-8").read()
         # strip comments/docstring prose: only executable references matter
         code = "\n".join(l for l in src.splitlines()
@@ -380,7 +386,7 @@ def test_scout_locates_exact_multi_token_spans():
               "are ['philosophy', 'music composition', 'education'].")
     offsets = MockTokenizerOffsets().encode_with_offsets(prompt)
 
-    span = sc.resolve_span(prompt, offsets, "music composition")
+    span = core.resolve_span(prompt, offsets, "music composition")
     lo, hi = span
     covered = prompt[offsets[lo][0]:offsets[hi - 1][1]]
     # token-granular, so punctuation glued to the phrase may ride along, but the
@@ -391,8 +397,8 @@ def test_scout_locates_exact_multi_token_spans():
 
     # pooling covers the whole span, and is not the first token
     hidden = np.arange(len(offsets) * 2, dtype=float).reshape(len(offsets), 2)
-    mean_vec = sc.pool_span(hidden, span, "mean")
-    last_vec = sc.pool_span(hidden, span, "last")
+    mean_vec = core.pool_span(hidden, span, "mean")
+    last_vec = core.pool_span(hidden, span, "last")
     assert np.allclose(mean_vec, hidden[lo:hi].mean(axis=0))
     assert np.allclose(last_vec, hidden[hi - 1])
     assert not np.allclose(mean_vec, hidden[lo]), "mean must not equal first token"
@@ -405,22 +411,22 @@ def test_scout_span_location_fails_loudly_when_ambiguous_or_absent():
     offsets = MockTokenizerOffsets().encode_with_offsets(prompt)
 
     try:
-        sc.resolve_span(prompt, offsets, "special aptitude")
-    except sc.SpanError as exc:
+        core.resolve_span(prompt, offsets, "special aptitude")
+    except core.SpanError as exc:
         assert "occurs 2 times" in str(exc), exc
     else:
         raise AssertionError("ambiguous phrase did not raise")
 
     # a window disambiguates deliberately
     cut = prompt.index("The words are")
-    span = sc.resolve_span(prompt, offsets, "special aptitude", window=(cut, len(prompt)))
+    span = core.resolve_span(prompt, offsets, "special aptitude", window=(cut, len(prompt)))
     assert offsets[span[0]][0] >= cut - 4, "window was ignored"
     covered = prompt[offsets[span[0]][0]:offsets[span[1] - 1][1]]
     assert "special aptitude" in covered, covered
 
     try:
-        sc.resolve_span(prompt, offsets, "quantum basket weaving")
-    except sc.SpanError as exc:
+        core.resolve_span(prompt, offsets, "quantum basket weaving")
+    except core.SpanError as exc:
         assert "does not occur" in str(exc)
     else:
         raise AssertionError("missing phrase did not raise")
@@ -455,7 +461,7 @@ def test_fab_wefat_behaviour_is_pole_set_matched_not_pooled():
     same fields.  If the accumulator pooled them, every P(brilliance) would come
     out at 0.5 and both correlations would be identical.
     """
-    spec = eb.DATASETS["fab"]
+    spec = ext.DATASETS["fab"]
     sessions = (_fab_sessions_with_poles("leslie", "model-a", "brilliance", "effort")
                 + _fab_sessions_with_poles("bian", "model-a", "effort", "brilliance"))
     scores = {f: wat_fab.FAB_SCORE[f] - 4.0 for f in wat_fab.FIELD_LABELS}
@@ -463,7 +469,7 @@ def test_fab_wefat_behaviour_is_pole_set_matched_not_pooled():
         scores.update({w: 0.8 for w in bri})
         scores.update({w: -0.8 for w in eff})
     fields, corr = [], []
-    eb.run_fab_wefat(spec, FakeEmbedder(scores), sessions, fields, corr)
+    ext.run_fab_wefat(spec, FakeEmbedder(scores), sessions, fields, corr)
 
     high = next(f for f in wat_fab.FIELD_LABELS if f in wat_fab.HIGH_TERT)
     low = next(f for f in wat_fab.FIELD_LABELS if f in wat_fab.LOW_TERT)
@@ -519,14 +525,14 @@ def _gb_sessions(models, pairs, control_set):
 
 
 def test_no_all_models_row_treats_one_delta_as_several_observations():
-    spec = eb.DATASETS["gb"]
-    arms = {k: v for k, v in eb.gb_arms().items() if k == "warmth"}
+    spec = ext.DATASETS["gb"]
+    arms = {k: v for k, v in ext.gb_arms().items() if k == "warmth"}
     pairs = list(zip(wgb.MALE_WORDS[:3], wgb.FEMALE_WORDS[:3]))
     sessions = _gb_sessions(["m1", "m2", "m3"], pairs, "warmth")
     emb = FakeEmbedder({w: 0.4 for w in wgb.MALE_WORDS})
 
     raw, agg, corr = [], [], []
-    eb.run_pair_level("gb", spec, arms, emb, sessions, raw, agg, corr)
+    ext.run_pair_level("gb", spec, arms, emb, sessions, raw, agg, corr)
 
     pair_corr = [c for c in corr
                  if c["level"] == "pair_level_delta_vs_behavioural_D"]
@@ -541,15 +547,15 @@ def test_no_all_models_row_treats_one_delta_as_several_observations():
 
 
 def test_arms_pooled_rows_are_descriptive_and_carry_no_p_value():
-    spec = eb.DATASETS["gb"]
-    arms = {k: v for k, v in eb.gb_arms().items() if k in ("warmth", "beauty")}
+    spec = ext.DATASETS["gb"]
+    arms = {k: v for k, v in ext.gb_arms().items() if k in ("warmth", "beauty")}
     pairs = list(zip(wgb.MALE_WORDS[:3], wgb.FEMALE_WORDS[:3]))
     sessions = (_gb_sessions(["m1"], pairs, "warmth")
                 + _gb_sessions(["m1"], pairs, "beauty"))
     emb = FakeEmbedder({w: 0.4 for w in wgb.MALE_WORDS})
 
     raw, agg, corr = [], [], []
-    eb.run_pair_level("gb", spec, arms, emb, sessions, raw, agg, corr)
+    ext.run_pair_level("gb", spec, arms, emb, sessions, raw, agg, corr)
 
     pooled = [c for c in corr if c["level"].endswith("@arms_pooled")]
     assert pooled, "the cross-arm row should still be reported, descriptively"
@@ -560,7 +566,7 @@ def test_arms_pooled_rows_are_descriptive_and_carry_no_p_value():
         assert c["behavioural_model"] != "(all models)"
 
     # and Holm never touches a descriptive row
-    eb.apply_holm(corr, key_of=lambda r: (None if not r["inferential"]
+    core.apply_holm(corr, key_of=lambda r: (None if not r["inferential"]
                                           else (r["dataset"], r["behavioural_model"])),
                   label_of=lambda r: f"pair_level::{r['dataset']}::{r['behavioural_model']}",
                   p_key="spearman_p", out_key="spearman_p_holm")
@@ -574,28 +580,28 @@ def test_arms_pooled_rows_are_descriptive_and_carry_no_p_value():
 
 def test_holm_matches_known_values_and_preserves_order_and_nans():
     # R: p.adjust(c(0.01, 0.04, 0.03), method = "holm") -> 0.03 0.06 0.06
-    got = eb.holm([0.01, 0.04, 0.03])
+    got = core.holm([0.01, 0.04, 0.03])
     assert [round(v, 12) for v in got] == [0.03, 0.06, 0.06], got
     # R: p.adjust(c(0.005, 0.011, 0.02, 0.3)) -> 0.020 0.033 0.040 0.300
-    got = eb.holm([0.005, 0.011, 0.02, 0.3])
+    got = core.holm([0.005, 0.011, 0.02, 0.3])
     assert [round(v, 12) for v in got] == [0.02, 0.033, 0.04, 0.3], got
     # monotone: a later p can never get a smaller adjusted value
     # R: p.adjust(c(0.2, 0.3, 0.4), method = "holm") -> 0.6 0.6 0.6
-    adj = eb.holm([0.2, 0.3, 0.4])
+    adj = core.holm([0.2, 0.3, 0.4])
     assert all(abs(a - 0.6) < 1e-12 for a in adj), adj
     assert all(adj[i] <= adj[i + 1] for i in range(len(adj) - 1))
     # capped at 1: 2 * 0.5 would be 1.0, 2 * 0.6 would exceed it
-    assert eb.holm([0.5, 0.6]) == [1.0, 1.0]
+    assert core.holm([0.5, 0.6]) == [1.0, 1.0]
     # NaNs stay missing and do not count towards the family size
-    got = eb.holm([0.01, float("nan"), 0.04])
+    got = core.holm([0.01, float("nan"), 0.04])
     assert got[1] != got[1]
     assert [round(got[0], 12), round(got[2], 12)] == [0.02, 0.04], got
     # order preserved: the largest raw p stays the largest adjusted p
     ps = [0.5, 0.001, 0.02, 0.2]
-    adj = eb.holm(ps)
+    adj = core.holm(ps)
     assert sorted(range(4), key=lambda i: ps[i]) == sorted(range(4), key=lambda i: adj[i])
     # a single finite p is unchanged
-    assert eb.holm([0.037])[0] == 0.037
+    assert core.holm([0.037])[0] == 0.037
 
 
 def test_holm_families_keep_fab_and_gb_set_level_separate():
@@ -603,7 +609,7 @@ def test_holm_families_keep_fab_and_gb_set_level_separate():
             dict(dataset="fab", emb_model="e", context="prompt", perm_p=0.20),
             dict(dataset="gb", emb_model="e", context="prompt", perm_p=0.01),
             dict(dataset="gb", emb_model="e", context="prompt", perm_p=0.20)]
-    eb.apply_holm(rows,
+    core.apply_holm(rows,
                   key_of=lambda r: (r["dataset"], r["emb_model"], r["context"]),
                   label_of=lambda r: f"{r['dataset']}_set_level",
                   p_key="perm_p", out_key="perm_p_holm")
@@ -622,13 +628,13 @@ def test_holm_families_keep_fab_and_gb_set_level_separate():
 # =========================================================
 
 def test_reported_scope_is_four_gb_controls_and_the_fab_tertile_split():
-    gb = eb.scoped("gb", eb.gb_arms())
+    gb = ext.scoped("gb", ext.gb_arms())
     assert set(gb) == {"humor", "creativity4", "warmth", "dedication_adj"}, set(gb)
     # "creativity with original" is the 4-word set: it is the one containing it
     assert "original" in wgb.CONTROL_SETS["creativity4"]
     assert "original" not in wgb.CONTROL_SETS["creativity"]
 
-    fab = eb.scoped("fab", eb.fab_arms())
+    fab = ext.scoped("fab", ext.fab_arms())
     assert set(fab) == {"leslie@tertile", "bian@tertile"}, set(fab)
     assert all(a["split"] == "tertile" for a in fab.values())
 
@@ -643,8 +649,8 @@ def test_reported_scope_is_four_gb_controls_and_the_fab_tertile_split():
         assert len(arm["A"]) == 10 and len(arm["B"]) == 10
 
     # every defined arm is still available for exploration
-    assert set(eb.gb_arms()) == set(wgb.CONTROL_SETS)
-    assert len(eb.fab_arms()) == 4
+    assert set(ext.gb_arms()) == set(wgb.CONTROL_SETS)
+    assert len(ext.fab_arms()) == 4
 
 
 # =========================================================
@@ -674,12 +680,12 @@ def test_scout_input_is_rebuilt_with_the_runner_system_message_and_template():
     user = ("Here is a list of words. For each word pick a word — female or "
             "father — and write it after the word. The words are "
             "['brilliant', 'kindly', 'genius', 'outgoing'].")
-    system = lh.SYSTEM_PROMPT
+    system = core.SYSTEM_PROMPT
     # the fixed experiment's system message is the behavioural runners' own
     assert system == wgb.SYSTEM_PROMPT == "You are a helpful assistant."
     assert system == wat_fab.SYSTEM_PROMPT
 
-    text, window = sc.build_chat_input(tok, system, user)
+    text, window = core.build_chat_input(tok, system, user)
     assert "<|header_start|>system<|header_end|>" in text
     assert system in text                       # the system message is present
     assert text.endswith("<|header_start|>assistant<|header_end|>\n\n")
@@ -696,28 +702,29 @@ def test_scout_span_lookup_is_confined_to_the_user_message():
     """
     tok = FakeChatTokenizer()
     user = "The words are ['assistant', 'genius', 'kindly']."
-    text, window = sc.build_chat_input(tok, "You are a helpful assistant.", user)
+    text, window = core.build_chat_input(tok, "You are a helpful assistant.", user)
 
     offsets = tok.encode_with_offsets(text)
     # unrestricted, 'assistant' is ambiguous -> loud failure, never a guess
     try:
-        sc.resolve_span(text, offsets, "assistant")
-    except sc.SpanError:
+        core.resolve_span(text, offsets, "assistant")
+    except core.SpanError:
         pass
     else:
         raise AssertionError("ambiguous phrase must raise without a window")
 
     # confined to the user window it resolves to the list occurrence
-    lo, hi = sc.resolve_span(text, offsets, "assistant", window=window)
+    lo, hi = core.resolve_span(text, offsets, "assistant", window=window)
     covered = "".join(text[s:e] for s, e in offsets[lo:hi])
     assert "assistant" in covered
     assert text.index("assistant", window[0]) >= window[0]
 
     # and the Scout forward pass looks phrases up inside that window only
-    sig = inspect.signature(sc.extract_prompt_vectors)
-    assert "user_window" in sig.parameters
-    assert "window=user_window" in tl._code_only(
-        inspect.getsource(sc.extract_prompt_vectors))
+    for backend in (llama_31, llama_scout):
+        sig = inspect.signature(backend.extract_prompt_vectors)
+        assert "user_window" in sig.parameters
+        assert "window=user_window" in tl._code_only(
+            inspect.getsource(backend.extract_prompt_vectors))
 
 
 def test_scout_refuses_a_template_that_mangles_the_saved_prompt():
@@ -729,8 +736,8 @@ def test_scout_refuses_a_template_that_mangles_the_saved_prompt():
 
     user = "pick a word — female or father — and write it"
     try:
-        sc.build_chat_input(Mangling(), "You are a helpful assistant.", user)
-    except sc.SpanError as exc:
+        core.build_chat_input(Mangling(), "You are a helpful assistant.", user)
+    except core.SpanError as exc:
         assert "verbatim" in str(exc)
     else:
         raise AssertionError("a template that rewrites the prompt must raise")
@@ -742,8 +749,8 @@ def test_scout_refuses_a_template_that_mangles_the_saved_prompt():
             return u + "\n" + u
 
     try:
-        sc.build_chat_input(Duplicating(), "sys", user)
-    except sc.SpanError as exc:
+        core.build_chat_input(Duplicating(), "sys", user)
+    except core.SpanError as exc:
         assert "twice" in str(exc)
     else:
         raise AssertionError("a duplicated user message must raise")
@@ -759,7 +766,7 @@ def test_creativity4_variants_are_not_pooled_by_label():
     whose control words are the `inventive` variant must NOT be scored against
     the `original` stimulus set just because the label matches.
     """
-    arms = eb.gb_arms()
+    arms = ext.gb_arms()
     c4 = arms["creativity4"]
     assert "original" in c4["B"] and "inventive" not in c4["B"]
 
@@ -771,7 +778,7 @@ def test_creativity4_variants_are_not_pooled_by_label():
                     female_word=wgb.FEMALE_WORDS[0], control_set="creativity4",
                     assignments=a, _file="synthetic.jsonl")
 
-    spec = eb.DATASETS["gb"]
+    spec = ext.DATASETS["gb"]
     assert spec["session_arms"](session("original"), arms) == ["creativity4"]
     for other in ("inventive", "unique", "resourceful", "visionary"):
         assert spec["session_arms"](session(other), arms) == [], other
@@ -781,7 +788,7 @@ def test_creativity4_variants_are_not_pooled_by_label():
 
 
 def test_incomplete_sessions_are_excluded_rather_than_scored_on_a_subset():
-    arms = {k: v for k, v in eb.gb_arms().items() if k == "warmth"}
+    arms = {k: v for k, v in ext.gb_arms().items() if k == "warmth"}
     arm = arms["warmth"]
     full = {w: "male" for w in arm["A"]}
     full.update({w: "female" for w in arm["B"]})
@@ -790,14 +797,14 @@ def test_incomplete_sessions_are_excluded_rather_than_scored_on_a_subset():
               assignments=full, _file="s.jsonl")
     partial = dict(ok, assignments={k: v for k, v in list(full.items())[:5]})
 
-    spec = eb.DATASETS["gb"]
+    spec = ext.DATASETS["gb"]
     assert spec["session_arms"](ok, arms) == ["warmth"]
     assert spec["session_arms"](partial, arms) == []
-    assert eb.arm_is_present(ok, arm) and not eb.arm_is_present(partial, arm)
+    assert ext.arm_is_present(ok, arm) and not ext.arm_is_present(partial, arm)
 
 
 def test_the_three_word_creativity_subset_does_not_swallow_creativity4():
-    arms = eb.gb_arms()
+    arms = ext.gb_arms()
     c3, c4 = arms["creativity"], arms["creativity4"]
     assert set(c3["A"]) | set(c3["B"]) < set(c4["A"]) | set(c4["B"]), \
         "this test exists because creativity is a strict subset of creativity4"
@@ -806,25 +813,25 @@ def test_the_three_word_creativity_subset_does_not_swallow_creativity4():
     r = dict(model="m", assignments=a, control_set="creativity4",
              male_word=wgb.MALE_WORDS[0], female_word=wgb.FEMALE_WORDS[0])
     # exact matching: the creativity4 session belongs to creativity4 ONLY
-    assert eb.DATASETS["gb"]["session_arms"](r, arms) == ["creativity4"]
-    assert not eb.arm_is_present(r, c3, "exact")
-    assert eb.arm_is_present(r, c3, "superset")      # which is why gb is exact
+    assert ext.DATASETS["gb"]["session_arms"](r, arms) == ["creativity4"]
+    assert not ext.arm_is_present(r, c3, "exact")
+    assert ext.arm_is_present(r, c3, "superset")      # which is why gb is exact
 
 
 def test_fab_sessions_sort_all_thirty_fields_so_arms_use_superset_matching():
-    arms = eb.scoped("fab", eb.fab_arms())
+    arms = ext.scoped("fab", ext.fab_arms())
     arm = arms["leslie@tertile"]
     assert len(set(arm["A"]) | set(arm["B"])) == 20     # one split, not all 30
     sess = _fab_sessions([("innate gift", "hard work", 1)])[0]
-    assert len(eb._assigned_items(sess)) == 30
-    assert eb.DATASETS["fab"]["session_arms"](sess, arms) == ["leslie@tertile"]
-    assert not eb.arm_is_present(sess, arm, "exact")    # 30 != 20
-    assert eb.arm_is_present(sess, arm, "superset")
+    assert len(ext._assigned_items(sess)) == 30
+    assert ext.DATASETS["fab"]["session_arms"](sess, arms) == ["leslie@tertile"]
+    assert not ext.arm_is_present(sess, arm, "exact")    # 30 != 20
+    assert ext.arm_is_present(sess, arm, "superset")
 
 
 def test_workbooks_are_the_declared_source_of_record():
     for ds, book in (("fab", "llm bias fab.xlsx"), ("gb", "llm bias gender.xlsx")):
-        path = eb.DATASETS[ds]["workbook"]
+        path = ext.DATASETS[ds]["workbook"]
         assert os.path.basename(path) == book
         assert os.path.exists(path), path
 
@@ -851,13 +858,13 @@ def test_a_stimulus_is_not_located_inside_a_longer_stimulus():
 
     # without the competing stimulus the resolver must refuse, not guess
     try:
-        sc.resolve_span(text, offs, "history")
-    except sc.SpanError as exc:
+        core.resolve_span(text, offs, "history")
+    except core.SpanError as exc:
         assert "2 times" in str(exc)
     else:
         raise AssertionError("two raw matches must not resolve silently")
 
-    span = sc.resolve_span(text, offs, "history",
+    span = core.resolve_span(text, offs, "history",
                            competitors=["art history", "physics"])
     start, end = span
     located = text[offs[start][0]:offs[end - 1][1]]
@@ -865,29 +872,29 @@ def test_a_stimulus_is_not_located_inside_a_longer_stimulus():
     assert "history" in located
 
     # and the longer stimulus is still locatable itself
-    sc.resolve_span(text, offs, "art history",
+    core.resolve_span(text, offs, "art history",
                     competitors=["art history", "history", "physics"])
 
 
 def test_male_is_not_located_inside_female():
     text = "pair 'female' and 'male' with the words below"
     offs = _offsets_for(text)
-    span = sc.resolve_span(text, offs, "male", competitors=["female", "male"])
+    span = core.resolve_span(text, offs, "male", competitors=["female", "male"])
     start, end = span
     assert "female" not in text[offs[start][0]:offs[end - 1][1]]
     # 'female' itself is unmasked: nothing longer contains it
-    sc.resolve_span(text, offs, "female", competitors=["female", "male"])
+    core.resolve_span(text, offs, "female", competitors=["female", "male"])
 
 
 def test_masking_only_applies_to_strictly_longer_containing_stimuli():
     """A competitor that does not contain the phrase must mask nothing."""
     text = "the word physics appears once here"
     offs = _offsets_for(text)
-    before = sc.resolve_span(text, offs, "physics")
-    after = sc.resolve_span(text, offs, "physics",
+    before = core.resolve_span(text, offs, "physics")
+    after = core.resolve_span(text, offs, "physics",
                             competitors=["chemistry", "physics", "art history"])
     assert before == after
-    assert sc.masking_spans(text, "physics", ["physics", "chemistry"]) == [], \
+    assert core.masking_spans(text, "physics", ["physics", "chemistry"]) == [], \
         "a stimulus must not mask itself"
 
 
@@ -896,18 +903,19 @@ def test_masking_a_phrase_out_of_existence_is_an_error_not_a_silent_skip():
     text = "only 'art history' is listed here"
     offs = _offsets_for(text)
     try:
-        sc.resolve_span(text, offs, "history", competitors=["art history"])
-    except sc.SpanError as exc:
+        core.resolve_span(text, offs, "history", competitors=["art history"])
+    except core.SpanError as exc:
         assert "does not occur" in str(exc)
     else:
         raise AssertionError("a fully masked phrase must raise")
 
 
 # =========================================================
-# 24. the fixed-prompt Scout runner
+# 24. the fixed-prompt Scout backend through the model-agnostic WAT runner
 # =========================================================
 
-SC_CODE = tl._code_only(open(sc.__file__, encoding="utf-8").read())
+SC_CODE = tl._code_only(open(llama_scout.__file__, encoding="utf-8").read())
+RUNNER_CODE = tl._code_only(open(wat_hidden.__file__, encoding="utf-8").read())
 SCOUT_BLOCKS = 48                      # test fixtures only, never the runner
 SCOUT_HIDDEN = SCOUT_BLOCKS + 1
 CPU = torch.device("cpu")
@@ -930,20 +938,25 @@ def _arch(n_blocks, dim=8):
     return dict(n_transformer_blocks=n_blocks, hidden_size=dim)
 
 
+def _scout_backend(model, tok, architecture):
+    """The real Scout Backend around the test fakes, inputs on the CPU."""
+    return llama_scout.Backend(model, tok, dict(input_device="cpu", **architecture))
+
+
 def _scout_run(records, *, response=None, n_blocks=SCOUT_BLOCKS, dim=8,
                architecture=None, acc=None):
-    """Frozen prompts through sc.run_prompts with the Llama 3.1 test fakes."""
+    """Frozen prompts through wat_hidden.run_prompts with the Scout backend."""
     tok = tl.FakeTokenizer()
     rows, failures = [], []
     for record in records:
-        roles = lh.prompt_roles(record, tl.STIM)
+        roles = core.prompt_roles(record, tl.STIM)
         text = tl.perfect_response(record, roles) if response is None else response
         model = tl.FakeModel(n_blocks=n_blocks, dim=dim, response=text,
                              tokenizer=tok)
-        r, f, meta = sc.run_prompts(
-            [record], tl.STIM, model, tok, args=tl.FakeArgs(), device=CPU,
-            architecture=architecture or _arch(n_blocks, dim), acc=acc,
-            verbose=False)
+        r, f, meta = wat_hidden.run_prompts(
+            [record], tl.STIM,
+            _scout_backend(model, tok, architecture or _arch(n_blocks, dim)),
+            args=tl.FakeArgs(), acc=acc, verbose=False)
         rows += r
         failures += f
     return rows, failures, meta
@@ -970,10 +983,10 @@ def _rows_equal(a, b):
 
 def _normalise_driver(src):
     """
-    Source with ONLY the explicit Scout plumbing removed: the `lh.` qualifier,
-    the input device, the architecture check, and the literal pooling default.
+    Source with ONLY the explicit Scout plumbing removed: the input device, the
+    architecture check, and the literal pooling default.
     """
-    code = tl._code_only(src).replace("lh.", "")
+    code = tl._code_only(src)
     code = re.sub(r"[^\n]*device = next\(model\.parameters\(\)\)\.device\n", "", code)
     code = re.sub(r"[^\n]*check_architecture\(out\.hidden_states, "
                   r"architecture, context\)\n", "", code)
@@ -1003,7 +1016,7 @@ class _TinyLlama4(torch.nn.Module):
 def _expect_exit(fn, *needles):
     try:
         fn()
-    except (SystemExit, sc.ArchitectureMismatch) as exc:
+    except (SystemExit, core.ArchitectureMismatch) as exc:
         for n in needles:
             assert n in str(exc), (n, str(exc))
         return
@@ -1012,7 +1025,7 @@ def _expect_exit(fn, *needles):
 
 def _fake_backend():
     return dict(
-        checkpoint=sc.CHECKPOINT, safetensors_shards=["model-00001.safetensors"],
+        checkpoint=llama_scout.CHECKPOINT, safetensors_shards=["model-00001.safetensors"],
         ignored_duplicates=[], model_class="Llama4ForConditionalGeneration",
         architectures=["Llama4ForConditionalGeneration"], dtype="torch.bfloat16",
         parameter_dtypes={"torch.bfloat16": 10},
@@ -1030,88 +1043,85 @@ def _fake_backend():
 
 def _fake_manifest():
     import argparse
-    args = argparse.Namespace(checkpoint=sc.CHECKPOINT, seed=0, out_dir=sc.OUT_DIR,
+    args = argparse.Namespace(checkpoint=llama_scout.CHECKPOINT, seed=0,
+                              out_dir=llama_scout.WAT_OUT_DIR,
                               max_new_tokens=512, domain="both", limit=None,
                               force=False, dry_run=False, smoke_test=False,
-                              stimuli=lh.STIMULI_CSV, prompts=lh.PROMPTS_CSV)
-    design = lh.design_summary(tl.ON_DISK, lh.STIMULI_CSV, lh.PROMPTS_CSV)
+                              stimuli=design.STIMULI_CSV, prompts=design.PROMPTS_CSV)
+    summary = design.design_summary(tl.ON_DISK, design.STIMULI_CSV, design.PROMPTS_CSV)
     bos = dict(bos_token="<|begin_of_text|>", bos_token_id=200000,
                bos_in_templated_text=1, bos_in_model_input=2, how="", decision="")
-    return sc.build_manifest(
-        backend=_fake_backend(),
-        arch=dict(transformers_version="x", torch_version="y"), design=design,
+    return wat_hidden.build_manifest(
+        backend_module=llama_scout, backend=_fake_backend(),
+        arch=dict(transformers_version="x", torch_version="y"), design=summary,
         n_hidden_states=SCOUT_HIDDEN, parse_failures=[],
-        generation=dict(lh.GENERATION), missing={}, args=args, bos=bos)
+        generation=dict(core.GENERATION), missing={}, args=args, bos=bos)
 
 
 # --- 24a. the same frozen design and the same shared code -----------------
 
 def test_scout_reads_the_same_frozen_272_prompt_design():
-    stim, prompts = lh.load_design(lh.STIMULI_CSV, lh.PROMPTS_CSV)
-    assert len(prompts) == 272 == lh.N_TOTAL
+    stim, prompts = design.load_design(design.STIMULI_CSV, design.PROMPTS_CSV)
+    assert len(prompts) == 272 == design.N_TOTAL
     assert prompts == tl.DESIGN == tl.ON_DISK
-    main_src = tl._code_only(inspect.getsource(sc.main))
-    assert "lh.load_design(" in main_src and "lh.STIMULI_CSV" in main_src
-    assert "lh.PROMPTS_CSV" in main_src and "lh.N_TOTAL" in main_src
+    main_src = tl._code_only(inspect.getsource(wat_hidden.main))
+    assert "load_design(" in main_src and "STIMULI_CSV" in main_src
+    assert "PROMPTS_CSV" in main_src and "N_TOTAL" in main_src
 
 
-def test_scout_calls_the_llama31_scientific_functions_rather_than_copies():
-    for name in ("layer_label", "arm_for", "prompt_roles", "parse_behaviour",
-                 "behaviour_wat_score", "prompt_seed",
-                 "assert_finite_hidden_states", "representation_scores",
-                 "wide_row", "write_primary_csv", "PrototypeAccumulator",
-                 "accumulate_prompt", "set_level_rows", "stimulus_layer_rows",
-                 "load_design", "design_summary", "weat_effect_size_hidden"):
-        assert not hasattr(sc, name), f"sc defines its own {name}"
-        assert f"def {name}(" not in SC_CODE and f"class {name}" not in SC_CODE
-    for name in ("SYSTEM_PROMPT", "GENERATION", "SEED_BASE", "N_TOTAL"):
-        assert not hasattr(sc, name), f"sc shadows lh.{name}"
-    assert inspect.signature(sc.extract_prompt_vectors).parameters[
-        "pooling"].default == lh.POOLING
+def test_the_backends_use_the_core_scientific_functions_rather_than_copies():
+    for backend in (llama_31, llama_scout):
+        code = tl._code_only(open(backend.__file__, encoding="utf-8").read())
+        for name in ("layer_label", "arm_for", "prompt_roles", "parse_behaviour",
+                     "behaviour_wat_score", "prompt_seed",
+                     "assert_finite_hidden_states", "representation_scores",
+                     "wide_row", "write_primary_csv", "PrototypeAccumulator",
+                     "accumulate_prompt", "set_level_rows", "stimulus_layer_rows",
+                     "weat_effect_size_hidden", "resolve_span", "pool_span",
+                     "build_chat_input"):
+            assert f"def {name}(" not in code and f"class {name}" not in code, \
+                (backend.__name__, name)
+            if hasattr(backend, name):
+                assert getattr(backend, name) is getattr(core, name), name
+        for name in ("load_design", "design_summary", "run_prompts"):
+            assert not hasattr(backend, name), f"{backend.__name__} has {name}"
+        for name in ("SYSTEM_PROMPT", "GENERATION", "SEED_BASE", "POOLING"):
+            if hasattr(backend, name):
+                assert getattr(backend, name) is getattr(core, name), name
+    assert inspect.signature(llama_scout.extract_prompt_vectors).parameters[
+        "pooling"].default == core.POOLING
 
 
-def test_the_span_layer_is_one_object_shared_with_the_llama31_runner():
+def test_the_span_layer_is_one_core_object_for_both_backends():
     for name in ("SpanError", "find_phrase_char_spans", "token_span_for_chars",
                  "masking_spans", "resolve_span", "pool_span", "build_chat_input"):
-        assert getattr(lh, name) is getattr(sc, name), name
+        for backend in (llama_31, llama_scout):
+            assert getattr(backend, name, getattr(core, name)) is getattr(core, name)
 
 
 def test_the_scout_driver_differs_from_llama31_only_in_device_and_architecture():
-    for name in ("generate_response", "extract_prompt_vectors", "run_prompts"):
-        mine = _normalise_driver(inspect.getsource(getattr(sc, name)))
-        theirs = _normalise_driver(inspect.getsource(getattr(lh, name)))
-        assert mine == theirs, f"sc.{name} drifted from lh.{name}"
-
-
-def test_the_two_modules_import_in_either_order():
-    import subprocess
-    here = os.path.dirname(os.path.abspath(__file__))
-    for first, second in (("embed_bias_llama3_hidden", "embed_bias_scout_hidden"),
-                          ("embed_bias_scout_hidden", "embed_bias_llama3_hidden")):
-        code = (f"import sys; sys.path.insert(0, {here!r}); import {first}, "
-                f"{second}; import embed_bias_scout_hidden as sc; "
-                f"assert sc.lh.GENERATION['temperature'] == 0.3")
-        out = subprocess.run([sys.executable, "-c", code], capture_output=True,
-                             text=True)
-        assert out.returncode == 0, out.stderr[-800:]
+    for name in ("generate_response", "extract_prompt_vectors"):
+        mine = _normalise_driver(inspect.getsource(getattr(llama_scout, name)))
+        theirs = _normalise_driver(inspect.getsource(getattr(llama_31, name)))
+        assert mine == theirs, f"llama_scout.{name} drifted from llama_31.{name}"
 
 
 # --- 24b. orientation, behaviour, delta, WEAT -----------------------------
 
 def test_scout_roles_follow_stimuli_not_presentation_order():
     for record in tl.DESIGN:
-        roles = lh.prompt_roles(record, tl.STIM)
+        roles = core.prompt_roles(record, tl.STIM)
         assert roles["X"] in roles["arm"]["X"] and roles["Y"] in roles["arm"]["Y"]
         assert {record["group0"], record["group1"]} == {roles["X"], roles["Y"]}
     g = next(r for r in tl.DESIGN if r["domain"] == "gender")
-    assert lh.prompt_roles(g, tl.STIM)["arm"]["X_name"] == "male targets"
+    assert core.prompt_roles(g, tl.STIM)["arm"]["X_name"] == "male targets"
     f = next(r for r in tl.DESIGN if r["domain"] == "fab")
-    assert lh.prompt_roles(f, tl.STIM)["arm"]["A_name"].startswith("high-FAB")
+    assert core.prompt_roles(f, tl.STIM)["arm"]["A_name"].startswith("high-FAB")
 
 
 def test_scout_behaviour_is_strict_and_unsmoothed():
     record = tl.DESIGN[0]
-    roles = lh.prompt_roles(record, tl.STIM)
+    roles = core.prompt_roles(record, tl.STIM)
     rows, fails, _ = _scout_run([record], n_blocks=3)
     assert rows[0]["behaviour_wat_score"] == 1.0 and not fails
     reversed_ = "\n".join(
@@ -1135,22 +1145,22 @@ def test_scout_parse_failure_keeps_every_representation_column():
     rows, fails, _ = _scout_run([tl.DESIGN[0]], response="I won't do that.")
     assert math.isnan(rows[0]["behaviour_wat_score"]) and len(fails) == 1
     assert rows[0]["response"] == "I won't do that."
-    for c in lh.layer_columns(SCOUT_HIDDEN):
+    for c in core.layer_columns(SCOUT_HIDDEN):
         assert not math.isnan(rows[0][c]), c
 
 
 def test_scout_delta_and_singleton_weat_match_the_hand_formula():
     record = tl.DESIGN[0]
-    roles = lh.prompt_roles(record, tl.STIM)
+    roles = core.prompt_roles(record, tl.STIM)
     tok = tl.FakeTokenizer()
     model = tl.FakeModel(n_blocks=SCOUT_BLOCKS, dim=8, tokenizer=tok)
-    templated, window = sc.build_chat_input(tok, lh.SYSTEM_PROMPT, record["prompt"])
-    vectors, meta = sc.extract_prompt_vectors(
+    templated, window = core.build_chat_input(tok, core.SYSTEM_PROMPT, record["prompt"])
+    vectors, meta = llama_scout.extract_prompt_vectors(
         templated, roles["phrases"], tok, model, device=CPU,
         architecture=_arch(SCOUT_BLOCKS), user_window=window,
         competitors=roles["phrases"])
-    deltas, weats = lh.representation_scores(vectors, roles,
-                                             meta["n_hidden_states"])
+    deltas, weats = core.representation_scores(vectors, roles,
+                                               meta["n_hidden_states"])
 
     def cos(u, v):
         return float(u @ v / (np.linalg.norm(u) * np.linalg.norm(v)))
@@ -1172,7 +1182,7 @@ def test_scout_delta_and_singleton_weat_match_the_hand_formula():
 def test_scout_run_prompts_reproduces_llama31_run_prompts_exactly():
     """Same frozen prompts, same fake model: identical rows, failures, prototypes."""
     records = [tl.DESIGN[0], tl.DESIGN[100], tl.DESIGN[-1]]
-    acc_s, acc_l = lh.PrototypeAccumulator(), lh.PrototypeAccumulator()
+    acc_s, acc_l = core.PrototypeAccumulator(), core.PrototypeAccumulator()
     mine, mf, _ = _scout_run(records, n_blocks=6, acc=acc_s)
     theirs, tf = _llama_run(records, n_blocks=6, acc=acc_l)
     assert len(mine) == len(theirs) == 3 and mf == tf
@@ -1192,23 +1202,23 @@ def test_scout_run_prompts_reproduces_llama31_run_prompts_exactly():
 def test_scout_hidden_state_and_span_failures_still_abort_the_run():
     record = tl.DESIGN[0]
     tok = tl.FakeTokenizer()
-    roles = lh.prompt_roles(record, tl.STIM)
+    roles = core.prompt_roles(record, tl.STIM)
     model = tl.FakeModel(n_blocks=4, bad=3, response=tl.perfect_response(record, roles),
                          tokenizer=tok)
     try:
-        sc.run_prompts([record], tl.STIM, model, tok, args=tl.FakeArgs(),
-                       device=CPU, architecture=_arch(4), verbose=False)
-    except lh.NonFiniteHiddenState as exc:
+        wat_hidden.run_prompts([record], tl.STIM, _scout_backend(model, tok, _arch(4)),
+                               args=tl.FakeArgs(), verbose=False)
+    except core.NonFiniteHiddenState as exc:
         assert "index 3" in str(exc)
     else:
         raise AssertionError("a NaN hidden state did not abort the run")
-    templated, window = sc.build_chat_input(tok, lh.SYSTEM_PROMPT, record["prompt"])
+    templated, window = core.build_chat_input(tok, core.SYSTEM_PROMPT, record["prompt"])
     try:
-        sc.extract_prompt_vectors(templated, ["not presented"], tok,
-                                  tl.FakeModel(n_blocks=4, tokenizer=tok),
-                                  device=CPU, architecture=_arch(4),
-                                  user_window=window, competitors=[])
-    except sc.SpanError:
+        llama_scout.extract_prompt_vectors(templated, ["not presented"], tok,
+                                           tl.FakeModel(n_blocks=4, tokenizer=tok),
+                                           device=CPU, architecture=_arch(4),
+                                           user_window=window, competitors=[])
+    except core.SpanError:
         pass
     else:
         raise AssertionError("an unresolvable span did not abort the run")
@@ -1219,20 +1229,21 @@ def test_scout_hidden_state_and_span_failures_still_abort_the_run():
 def test_a_48_block_fake_gives_the_49_level_primary_schema():
     rows, _, meta = _scout_run([tl.DESIGN[0]])
     assert meta["n_hidden_states"] == SCOUT_HIDDEN
-    assert list(rows[0]) == lh.primary_columns(SCOUT_HIDDEN)
+    assert list(rows[0]) == core.primary_columns(SCOUT_HIDDEN)
     assert "weat_layer48" in rows[0] and "delta_layer48" in rows[0]
     assert "weat_layer49" not in rows[0]
 
 
-def test_the_scout_runner_hard_codes_no_layer_count():
-    for n in ("48", "49", "32", "33", "5120", "4096"):
-        assert not re.search(rf"\b{n}\b", SC_CODE), f"literal {n} in the runner"
+def test_the_scout_backend_and_runner_hard_code_no_layer_count():
+    for label, code in (("llama_scout", SC_CODE), ("wat_hidden", RUNNER_CODE)):
+        for n in ("48", "49", "32", "33", "5120", "4096"):
+            assert not re.search(rf"\b{n}\b", code), f"literal {n} in {label}"
 
 
 def test_architecture_validation_rejects_a_wrong_hidden_state_count():
     states = [torch.zeros(1, 3, 8) for _ in range(SCOUT_HIDDEN)]
-    sc.check_architecture(states, _arch(SCOUT_BLOCKS))
-    _expect_exit(lambda: sc.check_architecture(states[:-1], _arch(SCOUT_BLOCKS)),
+    llama_scout.check_architecture(states, _arch(SCOUT_BLOCKS))
+    _expect_exit(lambda: llama_scout.check_architecture(states[:-1], _arch(SCOUT_BLOCKS)),
                  "48 hidden states", "implies 49")
     _expect_exit(lambda: _scout_run([tl.DESIGN[0]], n_blocks=47,
                                     architecture=_arch(SCOUT_BLOCKS)),
@@ -1242,7 +1253,7 @@ def test_architecture_validation_rejects_a_wrong_hidden_state_count():
 def test_architecture_validation_rejects_a_wrong_hidden_size():
     states = [torch.zeros(1, 3, 8) for _ in range(SCOUT_HIDDEN)]
     states[17] = torch.zeros(1, 3, 6)
-    _expect_exit(lambda: sc.check_architecture(states, _arch(SCOUT_BLOCKS)),
+    _expect_exit(lambda: llama_scout.check_architecture(states, _arch(SCOUT_BLOCKS)),
                  "hidden state 17", "width 6")
     _expect_exit(lambda: _scout_run([tl.DESIGN[0]], dim=6,
                                     architecture=_arch(SCOUT_BLOCKS, 8)),
@@ -1250,16 +1261,17 @@ def test_architecture_validation_rejects_a_wrong_hidden_size():
 
 
 def test_the_secondary_rows_cover_every_level_and_carry_the_scout_version():
-    acc = lh.PrototypeAccumulator()
+    acc = core.PrototypeAccumulator()
     records = tl.by_category(tl.DESIGN, "creativity")[:3] + \
         [r for r in tl.DESIGN if r["domain"] == "fab"][:2]
     _scout_run(records, n_blocks=SCOUT_BLOCKS, dim=6, acc=acc)
-    set_rows, stim_rows, _ = sc.secondary_rows(acc, records, tl.STIM, SCOUT_HIDDEN)
+    set_rows, stim_rows, _ = wat_hidden.secondary_rows(
+        acc, records, tl.STIM, SCOUT_HIDDEN, llama_scout.WAT_ANALYSIS_VERSION)
     assert set_rows and stim_rows
     assert len(set_rows) == 2 * SCOUT_HIDDEN
     for r in set_rows + stim_rows:
-        assert r["analysis_version"] == sc.ANALYSIS_VERSION
-        assert r["analysis_version"] != lh.ANALYSIS_VERSION
+        assert r["analysis_version"] == llama_scout.WAT_ANALYSIS_VERSION
+        assert r["analysis_version"] != llama_31.WAT_ANALYSIS_VERSION
     assert max(r["hidden_state_index"] for r in set_rows) == SCOUT_BLOCKS
     assert all(r["effect_size_sd"] == "population (ddof=0)" for r in set_rows)
 
@@ -1268,10 +1280,10 @@ def test_the_secondary_rows_cover_every_level_and_carry_the_scout_version():
 
 def test_text_config_of_prefers_the_nested_text_config():
     text = types.SimpleNamespace(num_hidden_layers=48, hidden_size=5120)
-    assert sc.text_config_of(types.SimpleNamespace(text_config=text)) is text
+    assert llama_scout.text_config_of(types.SimpleNamespace(text_config=text)) is text
     flat = types.SimpleNamespace(num_hidden_layers=32, hidden_size=4096)
-    assert sc.text_config_of(flat) is flat
-    src = tl._code_only(inspect.getsource(sc.load_scout))
+    assert llama_scout.text_config_of(flat) is flat
+    src = tl._code_only(inspect.getsource(llama_scout.load_scout))
     assert "tcfg = text_config_of(config)" in src
     assert "int(tcfg.num_hidden_layers)" in src and "int(tcfg.hidden_size)" in src
     assert "config.num_hidden_layers" not in src.replace("tcfg.", "")
@@ -1279,80 +1291,83 @@ def test_text_config_of_prefers_the_nested_text_config():
 
 def test_the_real_scout_config_resolves_to_48_blocks_of_5120():
     """Config JSON only — no weights."""
-    if not os.path.isdir(sc.CHECKPOINT):
+    if not os.path.isdir(llama_scout.CHECKPOINT):
         print("    (skipped: no Scout checkpoint on this machine)")
         return
     from transformers import AutoConfig
-    tcfg = sc.text_config_of(AutoConfig.from_pretrained(sc.CHECKPOINT))
+    tcfg = llama_scout.text_config_of(AutoConfig.from_pretrained(llama_scout.CHECKPOINT))
     assert (tcfg.num_hidden_layers, tcfg.hidden_size) == (48, 5120)
 
 
 def test_the_input_device_is_the_embedding_entry_of_a_multi_gpu_map():
     dmap = dict(SCOUT_DEVICE_MAP, **{"language_model.model.embed_tokens": 1})
-    assert sc.resolve_mapped_device(dmap, "language_model.model.embed_tokens") \
+    assert llama_scout.resolve_mapped_device(dmap, "language_model.model.embed_tokens") \
         == torch.device("cuda:1")
-    assert sc.resolve_mapped_device(SCOUT_DEVICE_MAP,
-                                    "language_model.model.layers.40.mlp") \
+    assert llama_scout.resolve_mapped_device(SCOUT_DEVICE_MAP,
+                                             "language_model.model.layers.40.mlp") \
         == torch.device("cuda:2")
     parent = {"vision_model": 0, "language_model.model": 2,
               "language_model.lm_head": 1}
-    assert sc.resolve_mapped_device(parent, "language_model.model.embed_tokens") \
+    assert llama_scout.resolve_mapped_device(parent, "language_model.model.embed_tokens") \
         == torch.device("cuda:2")
-    assert sc.resolve_mapped_device({"": "cuda:1"}, "a.b") == torch.device("cuda:1")
-    _expect_exit(lambda: sc.resolve_mapped_device({"vision_model": 0},
-                                                  "language_model.model.embed_tokens"),
-                 "not covered")
+    assert llama_scout.resolve_mapped_device({"": "cuda:1"}, "a.b") == torch.device("cuda:1")
+    _expect_exit(lambda: llama_scout.resolve_mapped_device(
+        {"vision_model": 0}, "language_model.model.embed_tokens"), "not covered")
 
 
 def test_the_embedding_module_is_found_by_identity_not_first_parameter():
     model = _TinyLlama4(SCOUT_DEVICE_MAP)
-    assert sc.embedding_module_name(model) == "language_model.model.embed_tokens"
+    assert llama_scout.embedding_module_name(model) == "language_model.model.embed_tokens"
     first = next(n for n, _ in model.named_parameters())
     assert first.startswith("vision_model"), "fixture must put vision first"
-    for name in ("generate_response", "extract_prompt_vectors", "run_prompts",
-                 "smoke_test", "main", "load_scout"):
+    for mod, name in ((llama_scout, "generate_response"),
+                      (llama_scout, "extract_prompt_vectors"),
+                      (llama_scout, "load_scout"), (llama_scout, "Backend"),
+                      (wat_hidden, "run_prompts"), (wat_hidden, "smoke_test"),
+                      (wat_hidden, "main")):
         assert "next(model.parameters())" not in tl._code_only(
-            inspect.getsource(getattr(sc, name))), name
+            inspect.getsource(getattr(mod, name))), name
 
 
 def test_a_mapped_device_that_disagrees_with_the_weight_is_refused():
-    _expect_exit(lambda: sc.input_embedding_device(_TinyLlama4({"": 0})),
+    _expect_exit(lambda: llama_scout.input_embedding_device(_TinyLlama4({"": 0})),
                  "refusing to guess")
 
 
 def test_cpu_disk_and_meta_placements_are_rejected():
-    assert sc.validate_device_map(SCOUT_DEVICE_MAP) == ["cuda:0", "cuda:1", "cuda:2"]
+    assert llama_scout.validate_device_map(SCOUT_DEVICE_MAP) == \
+        ["cuda:0", "cuda:1", "cuda:2"]
     for bad in ("cpu", "disk", "meta"):
         dmap = dict(SCOUT_DEVICE_MAP, **{"language_model.model.layers.47": bad})
-        _expect_exit(lambda: sc.validate_device_map(dmap), "off-GPU", bad)
-        _expect_exit(lambda: sc.resolve_mapped_device(
+        _expect_exit(lambda: llama_scout.validate_device_map(dmap), "off-GPU", bad)
+        _expect_exit(lambda: llama_scout.resolve_mapped_device(
             {"language_model.model": bad}, "language_model.model.embed_tokens"),
             bad)
 
 
 def test_an_empty_or_missing_device_map_is_rejected():
-    _expect_exit(lambda: sc.validate_device_map({}), "no hf_device_map")
-    _expect_exit(lambda: sc.validate_device_map(None), "no hf_device_map")
+    _expect_exit(lambda: llama_scout.validate_device_map({}), "no hf_device_map")
+    _expect_exit(lambda: llama_scout.validate_device_map(None), "no hf_device_map")
     model = _TinyLlama4(None)
-    _expect_exit(lambda: sc.input_embedding_device(model), "not covered")
+    _expect_exit(lambda: llama_scout.input_embedding_device(model), "not covered")
 
 
 def test_actual_parameter_devices_are_validated_too():
-    _expect_exit(lambda: sc.validate_parameter_devices(torch.nn.Linear(2, 2)),
+    _expect_exit(lambda: llama_scout.validate_parameter_devices(torch.nn.Linear(2, 2)),
                  "cpu")
-    _expect_exit(lambda: sc.validate_parameter_devices(
+    _expect_exit(lambda: llama_scout.validate_parameter_devices(
         torch.nn.Linear(2, 2, device="meta")), "meta")
-    src = tl._code_only(inspect.getsource(sc.load_scout))
+    src = tl._code_only(inspect.getsource(llama_scout.load_scout))
     assert "validate_parameter_devices(model)" in src
 
 
 def test_the_loader_is_the_verified_bf16_sdpa_auto_load():
-    src = tl._code_only(inspect.getsource(sc.load_scout))
+    src = tl._code_only(inspect.getsource(llama_scout.load_scout))
     assert "Llama4ForConditionalGeneration.from_pretrained(" in src
     assert 'device_map="auto"' in src and "low_cpu_mem_usage=True" in src
     assert "attn_implementation=ATTN_IMPLEMENTATION" in src
-    assert sc.ATTN_IMPLEMENTATION == "sdpa"
-    assert 'dtype="bfloat16"' in inspect.getsource(sc.load_scout).split(")")[0]
+    assert llama_scout.ATTN_IMPLEMENTATION == "sdpa"
+    assert 'dtype="bfloat16"' in inspect.getsource(llama_scout.load_scout).split(")")[0]
     assert "validate_device_map(device_map)" in src and "model.eval()" in src
     assert not re.search(r"max_memory\s*=", SC_CODE)
     for banned in ("offload_folder", "offload_state_dict", "load_in_4bit",
@@ -1361,7 +1376,7 @@ def test_the_loader_is_the_verified_bf16_sdpa_auto_load():
         assert banned not in SC_CODE, banned
 
 
-def test_the_scout_runner_is_text_only():
+def test_the_scout_backend_is_text_only():
     for banned in ("pixel_values=", "AutoProcessor", "processor(", "<|image|>",
                    "images="):
         assert banned not in SC_CODE, banned
@@ -1370,8 +1385,8 @@ def test_the_scout_runner_is_text_only():
 # --- 24e. no legacy path --------------------------------------------------
 
 def test_no_legacy_scout_execution_path_remains():
-    for banned in ("load_sessions", "session_D", "session_arms", "eb.DATASETS",
-                   "eb.scoped", "jsonl", "behavioural_model",
+    for banned in ("load_sessions", "session_D", "session_arms", "ext.DATASETS",
+                   "ext.scoped", "jsonl", "behavioural_model",
                    "SCOUT_BEHAVIOURAL_MODELS", "_assigned_items",
                    "system_prompt_for", "preflight", "ollama", "Ollama",
                    "load_backend", "parameter_footprint", "execution_device",
@@ -1379,28 +1394,28 @@ def test_no_legacy_scout_execution_path_remains():
                    "nullify", "top_components", "max_valid_k", "pca", "PCA",
                    "trial_layer_rows", "aggregate_pairs", "layer_correlations",
                    "layer_association", "extract_prompt_hidden_states"):
-        assert banned not in SC_CODE, f"{banned!r} is still in the Scout runner"
-        assert not hasattr(sc, banned), f"sc.{banned} survived"
+        assert banned not in SC_CODE, f"{banned!r} is still in the Scout backend"
+        assert not hasattr(llama_scout, banned), f"llama_scout.{banned} survived"
 
 
-def test_scout_writes_the_llama31_output_set_to_its_own_directory():
-    main_src = tl._code_only(inspect.getsource(sc.main))
-    assert "lh.PRIMARY_CSV" in main_src
-    for fname in lh.OUTPUT_FILES:
-        if fname != lh.PRIMARY_CSV:
+def test_scout_writes_the_wat_output_set_to_its_own_directory():
+    main_src = tl._code_only(inspect.getsource(wat_hidden.main))
+    assert "PRIMARY_CSV" in main_src
+    for fname in wat_hidden.OUTPUT_FILES:
+        if fname != wat_hidden.PRIMARY_CSV:
             assert f'"{fname}"' in main_src, fname
-    assert os.path.basename(sc.OUT_DIR) == "embed_scout"
-    assert sc.OUT_DIR != lh.OUT_DIR
+    assert os.path.basename(llama_scout.WAT_OUT_DIR) == "embed_scout"
+    assert llama_scout.WAT_OUT_DIR != llama_31.WAT_OUT_DIR
     legacy = {"hidden_trial_layer.csv", "hidden_pair_layer_aggregated.csv",
               "hidden_layer_correlations.csv", "hidden_nullified_layer.csv",
               "hidden_manifest.json"}
-    assert legacy.isdisjoint(lh.OUTPUT_FILES)
+    assert legacy.isdisjoint(wat_hidden.OUTPUT_FILES)
 
 
-def test_scout_dry_run_loads_no_tokenizer_or_model():
-    src = tl._code_only(inspect.getsource(sc.main))
+def test_dry_run_loads_no_tokenizer_or_model():
+    src = tl._code_only(inspect.getsource(wat_hidden.main))
     dry = src.index("if args.dry_run:")
-    load = src.index("load_scout(")
+    load = src.index("backend_module.load(")
     assert dry < load
     assert "AutoTokenizer" not in src[:load]
 
@@ -1419,18 +1434,18 @@ def test_the_scout_manifest_records_what_the_spec_requires():
                 "orientation", "behavioural_metric", "fail_fast",
                 "analysis_logic_source"):
         assert key in m, key
-    assert m["analysis_version"] == sc.ANALYSIS_VERSION
+    assert m["analysis_version"] == llama_scout.WAT_ANALYSIS_VERSION
     assert m["hf_device_map"] == _fake_backend()["hf_device_map"]
     assert m["attn_implementation"] == "sdpa" and m["quantisation"] == "none"
     assert m["cpu_offload"] is False and m["disk_offload"] is False
     assert m["n_hidden_states"] == SCOUT_HIDDEN
     assert m["layer_convention"]["n_transformer_blocks"] == SCOUT_BLOCKS
-    assert m["generation"] == lh.GENERATION
-    assert m["design"]["prompts_sha256"] == lh.file_digest(lh.PROMPTS_CSV)
+    assert m["generation"] == core.GENERATION
+    assert m["design"]["prompts_sha256"] == design.file_digest(design.PROMPTS_CSV)
     assert "architecture_mismatch" in m["fail_fast"]
     src = m["analysis_logic_source"]
-    assert src["file"] == "embedding/embed_bias_llama3_hidden.py"
-    assert src["sha256"] == lh.file_digest(lh.__file__)
+    assert src["file"] == "embedding/core.py"
+    assert src["sha256"] == design.file_digest(core.__file__)
 
 
 def test_the_scout_manifest_carries_no_stale_llama31_description():
@@ -1438,7 +1453,7 @@ def test_the_scout_manifest_carries_no_stale_llama31_description():
     m.pop("analysis_logic_source")                    # explicit provenance only
     text = json.dumps(m, default=str)
     for stale in ("Llama-3.1", "Llama 3.1", "llama3.1", "llama31", "Llama3",
-                  "/home/syryu", lh.ANALYSIS_VERSION, lh.CHECKPOINT,
+                  "/home/syryu", llama_31.WAT_ANALYSIS_VERSION, llama_31.CHECKPOINT,
                   "3420-prompt"):
         assert stale not in text, stale
 
@@ -1451,18 +1466,19 @@ def test_the_bos_record_counts_template_and_tokenizer_bos_separately():
             body = text[len("<s>"):] if text.startswith("<s>") else text
             return {"input_ids": [1, 1] + [5] * len(body.split())}
 
-    rec = sc.bos_record(_BosTok(), "<s>hello there")
+    rec = core.bos_record(_BosTok(), "<s>hello there")
     assert rec["bos_in_templated_text"] == 1 and rec["bos_in_model_input"] == 2
     assert "kept deliberately" in rec["decision"]
-    for name in ("generate_response", "extract_prompt_vectors"):
-        assert "add_special_tokens" not in inspect.getsource(getattr(sc, name))
+    for backend in (llama_31, llama_scout):
+        for name in ("generate_response", "extract_prompt_vectors"):
+            assert "add_special_tokens" not in inspect.getsource(getattr(backend, name))
 
 
 def _scout_tokenizer():
-    if not os.path.isfile(os.path.join(sc.CHECKPOINT, "tokenizer.json")):
+    if not os.path.isfile(os.path.join(llama_scout.CHECKPOINT, "tokenizer.json")):
         return None
     from transformers import AutoTokenizer
-    return AutoTokenizer.from_pretrained(sc.CHECKPOINT)
+    return AutoTokenizer.from_pretrained(llama_scout.CHECKPOINT)
 
 
 def test_the_real_scout_tokenizer_feeds_the_model_two_bos_tokens():
@@ -1471,8 +1487,8 @@ def test_the_real_scout_tokenizer_feeds_the_model_two_bos_tokens():
     if tok is None:
         print("    (skipped: no Scout tokenizer on this machine)")
         return
-    templated, _ = sc.build_chat_input(tok, lh.SYSTEM_PROMPT, tl.DESIGN[0]["prompt"])
-    rec = sc.bos_record(tok, templated)
+    templated, _ = core.build_chat_input(tok, core.SYSTEM_PROMPT, tl.DESIGN[0]["prompt"])
+    rec = core.bos_record(tok, templated)
     assert rec["bos_token"] == "<|begin_of_text|>"
     assert rec["bos_in_templated_text"] == 1
     assert rec["bos_in_model_input"] == 2
@@ -1486,9 +1502,76 @@ def test_every_frozen_stimulus_resolves_under_the_real_scout_tokenizer():
     if tok is None:
         print("    (skipped: no Scout tokenizer on this machine)")
         return
-    lo, hi, n_bos = sc.validate_all_spans(tok, tl.ON_DISK, tl.STIM)
+    lo, hi, n_bos = core.validate_all_spans(tok, tl.ON_DISK, tl.STIM)
     assert n_bos == [2]
     assert 0 < lo <= hi
+
+
+# --- 24g. package architecture --------------------------------------------
+
+def _imported_modules(path):
+    """Every module name a file imports (absolute imports, any depth)."""
+    import ast
+    tree = ast.parse(open(path, encoding="utf-8").read())
+    out = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            out.update(a.name for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            out.add(node.module)
+            out.update(f"{node.module}.{a.name}" for a in node.names)
+    return out
+
+
+def test_no_backend_imports_another_backend():
+    names = {"llama_31", "llama_scout", "openai"}
+    for mod in (llama_31, llama_scout, backend_openai):
+        own = mod.__name__.rsplit(".", 1)[1]
+        imported = _imported_modules(mod.__file__)
+        for other in names - {own}:
+            assert not any(i.endswith(f"backends.{other}") for i in imported), \
+                (own, other)
+
+
+def test_core_and_design_import_no_backend_and_runners_only_the_registry():
+    for mod in (core, design):
+        assert not any("backends" in i for i in _imported_modules(mod.__file__)), \
+            mod.__name__
+    from embedding import chained_hidden
+    for mod in (wat_hidden, chained_hidden):
+        imported = _imported_modules(mod.__file__)
+        assert not any(i.endswith(("llama_31", "llama_scout"))
+                       for i in imported), mod.__name__
+
+
+def test_importing_core_or_a_runner_loads_no_transformers_or_weights():
+    import subprocess
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for module in ("embedding.core", "embedding.design", "embedding.wat_hidden",
+                   "embedding.chained_hidden", "embedding.backends.llama_scout",
+                   "embedding.backends.llama_31"):
+        code = (f"import sys; sys.path.insert(0, {root!r}); import {module}; "
+                f"assert 'transformers' not in sys.modules, 'transformers'; "
+                f"assert 'torch' not in sys.modules, 'torch'; "
+                f"assert 'openai' not in sys.modules, 'openai SDK'")
+        out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+        assert out.returncode == 0, (module, out.stderr[-600:])
+
+
+def test_the_openai_backend_is_a_clear_placeholder():
+    from embedding import backends
+    assert "openai" in backends.names() and "openai" not in backends.implemented()
+    try:
+        backends.get_backend("openai")
+    except NotImplementedError as exc:
+        assert "placeholder" in str(exc)
+    else:
+        raise AssertionError("the openai placeholder was selectable")
+    try:
+        backend_openai.load()
+    except NotImplementedError:
+        return
+    raise AssertionError("the openai placeholder loaded")
 
 
 def main():

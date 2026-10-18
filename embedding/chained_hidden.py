@@ -15,11 +15,12 @@ WHAT ONE ROW GIVES
     separate design file, runner and output directory.
 
 REUSED, NOT RE-IMPLEMENTED
-    model loading, generation, the hidden-state forward pass, span resolution,
-    competitor masking, mean pooling, role resolution, the strict WAT parser, the
-    unsmoothed Bai score, delta / standardized WEAT and the prototype
-    accumulator are the Llama 3.1 runner's (`lh`) and the Scout runner's (`sc`)
-    own functions.  Task 2/3 wording and the Task-3 judges are
+    Model loading, generation and the hidden-state forward pass are the selected
+    backend's (`embedding.backends`, chosen once with --model).  Span
+    resolution, competitor masking, mean pooling, role resolution, the strict
+    WAT parser, the unsmoothed Bai score, delta / standardized WEAT and the
+    prototype accumulator are `embedding.core`; the design is
+    `embedding.design`.  Task 2/3 wording and the Task-3 judges are
     `decision_text.py`, the code the decision tasks render with.
 
 TASK-1 ONLY REPRESENTATIONS
@@ -75,13 +76,13 @@ OUTPUT  (responses/embed_llama31_chained/ or responses/embed_scout_chained/)
     manifest.json
 
 USAGE
-    python3 embedding/embed_bias_chained_hidden.py --model scout --dry-run
-    python3 embedding/embed_bias_chained_hidden.py --model scout --smoke-test
-    python3 embedding/embed_bias_chained_hidden.py --model scout --limit 5 \\
+    python -m embedding.chained_hidden --model scout --dry-run
+    python -m embedding.chained_hidden --model scout --smoke-test
+    python -m embedding.chained_hidden --model scout --limit 5 \\
         --out-dir responses/embed_scout_chained_diag5
-    python3 embedding/embed_bias_chained_hidden.py --model scout
-    python3 embedding/embed_bias_chained_hidden.py --model scout --judge
-    python3 embedding/embed_bias_chained_hidden.py --model llama31 \\
+    python -m embedding.chained_hidden --model scout
+    python -m embedding.chained_hidden --model scout --judge
+    python -m embedding.chained_hidden --model llama31 \\
         --checkpoint <path to Llama-3.1-8B-Instruct>
 """
 
@@ -96,23 +97,13 @@ import argparse
 from collections import defaultdict
 from datetime import datetime, timezone
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(HERE)
-sys.path.insert(0, HERE)
-sys.path.insert(0, ROOT)
-
-import embed_bias as eb
-import embed_bias_scout_hidden as sc          # imports lh too; order-safe
-import embed_bias_llama3_hidden as lh
-import make_bai_style_prompts as mk
-import make_chained_prompts as mc
+from embedding import ROOT, backends, core, design
 import decision_text as dt
 
-MODELS = ("llama31", "scout")
-ANALYSIS_VERSION = {"llama31": "chained-1.0-llama31", "scout": "chained-1.0-scout"}
-OUT_DIRS = {"llama31": os.path.join(ROOT, "responses", "embed_llama31_chained"),
-            "scout": os.path.join(ROOT, "responses", "embed_scout_chained")}
-WAT_ONLY_DIRS = (lh.OUT_DIR, sc.OUT_DIR)
+# A backend's chained analysis version and output directory are its own
+# (CHAINED_ANALYSIS_VERSION, CHAINED_OUT_DIR); the WAT-only result directories
+# of every backend are off limits to this runner.
+WAT_ONLY_DIRS = backends.wat_out_dirs()
 
 # Same sampling as the WAT-only run (temperature 0.3, do_sample, top_p 1, top_k 0);
 # only the length budget is larger, because one continuation now holds a WAT
@@ -209,7 +200,7 @@ def task1_window(templated, user_window, row):
     start = user_window[0] + int(row["task1_start"])
     end = user_window[0] + int(row["task1_end"])
     if templated[start:end] != row["task1_prompt"]:
-        raise lh.SpanError(f"{row['prompt_id']}: the Task-1 window does not hold "
+        raise core.SpanError(f"{row['prompt_id']}: the Task-1 window does not hold "
                            f"the Task-1 prompt; refusing to locate spans")
     return start, end
 
@@ -218,44 +209,8 @@ def task1_window(templated, user_window, row):
 # Backends — thin adapters over the two WAT-only runners
 # =========================================================
 
-def load_backend(model_key, args):
-    """dict(tokenizer, generate, extract, meta) for llama31 or scout."""
-    import torch
-    if model_key == "llama31":
-        model, tok, meta = lh.load_llama3(args.checkpoint or lh.CHECKPOINT, args.gpu)
-
-        def generate(templated, seed, generation):
-            return lh.generate_response(templated, tok, model, seed=seed,
-                                        generation=generation)
-
-        def extract(templated, phrases, window, context):
-            return lh.extract_prompt_vectors(templated, phrases, tok, model,
-                                             user_window=window,
-                                             competitors=phrases, context=context)
-    elif model_key == "scout":
-        model, tok, meta = sc.load_scout(args.checkpoint or sc.CHECKPOINT)
-        device = torch.device(meta["input_device"])
-        architecture = dict(n_transformer_blocks=meta["n_transformer_blocks"],
-                            hidden_size=meta["hidden_size"])
-
-        def generate(templated, seed, generation):
-            return sc.generate_response(templated, tok, model, seed=seed,
-                                        device=device, generation=generation)
-
-        def extract(templated, phrases, window, context):
-            return sc.extract_prompt_vectors(templated, phrases, tok, model,
-                                             device=device,
-                                             architecture=architecture,
-                                             user_window=window,
-                                             competitors=phrases, context=context)
-    else:
-        raise SystemExit(f"unknown model {model_key!r} (have {MODELS})")
-    return dict(model_key=model_key, tokenizer=tok, generate=generate,
-                extract=extract, meta=meta, model=model)
-
-
 def generation_config(args):
-    return dict(lh.GENERATION, max_new_tokens=args.max_new_tokens)
+    return dict(core.GENERATION, max_new_tokens=args.max_new_tokens)
 
 
 # =========================================================
@@ -264,34 +219,36 @@ def generation_config(args):
 
 def score_behaviour(response_1, row, roles):
     """(score, problem) — the WAT-only strict parser and unsmoothed score."""
-    assign, problems = lh.parse_behaviour(response_1, row, roles)
+    assign, problems = core.parse_behaviour(response_1, row, roles)
     if problems:
         return float("nan"), " | ".join(problems), len(assign)
-    score, denom = lh.behaviour_wat_score(assign, row, roles)
+    score, denom = core.behaviour_wat_score(assign, row, roles)
     return score, (denom or ""), len(assign)
 
 
 def run_one(row, stim, backend, *, args, acc=None):
     """(prompt_weat row, behaviour failure or None, decision failure or None, meta)."""
-    tok = backend["tokenizer"]
-    roles = lh.prompt_roles(row, stim)
-    templated, user_window = lh.build_chat_input(tok, lh.SYSTEM_PROMPT, row["prompt"])
+    tok = backend.tokenizer
+    roles = core.prompt_roles(row, stim)
+    templated, user_window = core.build_chat_input(tok, core.SYSTEM_PROMPT, row["prompt"])
     window = task1_window(templated, user_window, row)
-    seed = lh.prompt_seed(row["prompt_id"], args.seed)
+    seed = core.prompt_seed(row["prompt_id"], args.seed)
     cfg = generation_config(args)
 
-    response, gen_meta = backend["generate"](templated, seed, cfg)
-    vectors, meta = backend["extract"](templated, roles["phrases"], window,
-                                       row["prompt_id"])
-    want = backend["meta"]["n_transformer_blocks"] + 1
+    response, gen_meta = backend.generate(templated, seed=seed, generation=cfg)
+    vectors, meta = backend.extract_hidden(templated, roles["phrases"],
+                                           user_window=window,
+                                           competitors=roles["phrases"],
+                                           context=row["prompt_id"])
+    want = backend.meta["n_transformer_blocks"] + 1
     if meta["n_hidden_states"] != want:
-        raise sc.ArchitectureMismatch(
+        raise core.ArchitectureMismatch(
             f"{row['prompt_id']}: {meta['n_hidden_states']} hidden states, "
             f"config implies {want} — aborting the run")
     offsets = token_offsets(tok, templated)
     for phrase, (lo, hi) in meta["spans"].items():
         if not (window[0] <= offsets[lo][0] and offsets[hi - 1][1] <= window[1]):
-            raise lh.SpanError(f"{row['prompt_id']}: {phrase!r} resolved outside "
+            raise core.SpanError(f"{row['prompt_id']}: {phrase!r} resolved outside "
                                f"Task 1")
 
     sections, sec_problems = split_sections(response)
@@ -311,8 +268,8 @@ def run_one(row, stim, backend, *, args, acc=None):
                         problems=beh_problem,
                         response=r1 if sections else response)
 
-    deltas, weats = lh.representation_scores(vectors, roles, meta["n_hidden_states"])
-    out = {"model": backend["model_key"], "prompt_id": row["prompt_id"],
+    deltas, weats = core.representation_scores(vectors, roles, meta["n_hidden_states"])
+    out = {"model": backend.name, "prompt_id": row["prompt_id"],
            "domain": row["domain"], "category": row["category"],
            "trial": int(row["trial"])}
     out.update({c: row[c] for c in DESIGN_COLUMNS})
@@ -339,7 +296,7 @@ def run_one(row, stim, backend, *, args, acc=None):
         out[f"weat_score_layer{i}"] = v
 
     if acc is not None:
-        lh.accumulate_prompt(acc, row["domain"], row["category"], vectors,
+        core.accumulate_prompt(acc, row["domain"], row["category"], vectors,
                              roles["phrases"], row["prompt_id"])
     return out, beh_fail, dec_fail, dict(meta, **gen_meta)
 
@@ -467,17 +424,18 @@ def default_judge_call(jp, jm):
 # Set level
 # =========================================================
 
-def stimulus_rows(acc, rows_meta, stim, model_key):
+def stimulus_rows(acc, rows_meta, stim, model_key, analysis_version):
     out = []
     for domain, category in sorted({(r["domain"], r["category"]) for r in rows_meta}):
         if not acc.stimuli(domain, category):
             continue
-        arm = lh.arm_for(domain, category, stim)
-        for r in lh.stimulus_layer_rows(acc, domain, category, arm,
-                                        n_hidden_states=_n_levels(acc)):
+        arm = core.arm_for(domain, category, stim)
+        for r in core.stimulus_layer_rows(acc, domain, category, arm,
+                                        n_hidden_states=_n_levels(acc),
+                                        analysis_version=analysis_version):
             r = dict(model=model_key, **r)
             r.update(prototype_file=PROTOTYPES_NPZ,
-                     analysis_version=ANALYSIS_VERSION[model_key])
+                     analysis_version=analysis_version)
             r.pop("analysis_role", None)
             out.append(r)
     return out
@@ -487,7 +445,7 @@ def _n_levels(acc):
     return next(iter(acc.sums.values())).shape[0]
 
 
-def set_weat_rows(stim_rows, stim, model_key):
+def set_weat_rows(stim_rows, stim, model_key, analysis_version):
     """
     The conventional full-set WEAT score, from the stimulus-level associations:
         weat_score = [mean s(X) - mean s(Y)] / population SD of s over X ∪ Y
@@ -498,7 +456,7 @@ def set_weat_rows(stim_rows, stim, model_key):
         groups[(r["domain"], r["category"], r["hidden_state_index"])].append(r)
     out = []
     for (domain, category, i), rs in sorted(groups.items()):
-        arm = lh.arm_for(domain, category, stim)
+        arm = core.arm_for(domain, category, stim)
         sX = [r["s_w_A_B"] for r in rs if r["role"] == "X"]
         sY = [r["s_w_A_B"] for r in rs if r["role"] == "Y"]
         if not sX or not sY:
@@ -506,7 +464,7 @@ def set_weat_rows(stim_rows, stim, model_key):
         sd = float(np.std(np.asarray(sX + sY, dtype=float), ddof=0))
         score = (float(np.mean(sX) - np.mean(sY)) / sd
                  if sd > 0 and math.isfinite(sd) else float("nan"))
-        lab = lh.layer_label(i)
+        lab = core.layer_label(i)
         out.append(dict(
             model=model_key, domain=domain, category=category,
             hidden_state_index=lab["hidden_state_index"],
@@ -520,7 +478,7 @@ def set_weat_rows(stim_rows, stim, model_key):
             X_name=arm["X_name"], Y_name=arm["Y_name"],
             A_name=arm["A_name"], B_name=arm["B_name"],
             sd_convention="population (ddof=0) over X ∪ Y",
-            pooling=lh.POOLING, analysis_version=ANALYSIS_VERSION[model_key]))
+            pooling=core.POOLING, analysis_version=analysis_version))
     return out
 
 
@@ -557,22 +515,21 @@ def check_out_dir(out_dir):
                              f"chained runner never writes there")
 
 
-def build_manifest(*, model_key, backend_meta, n_hidden_states, args, rows,
-                   n_behaviour_failures, bos):
+def build_manifest(*, model_key, analysis_version, backend_file, backend_meta,
+                   n_hidden_states, args, rows, n_behaviour_failures, bos):
     import torch, transformers
-    files = {"chained_prompts_csv": mc.CHAINED_CSV, "prompts_csv": mk.PROMPTS_CSV,
-             "stimuli_csv": mk.STIMULI_CSV, "decision_text": dt.__file__,
-             "make_chained_prompts": mc.__file__,
-             "wat_only_runner_llama31": lh.__file__,
-             "wat_only_runner_scout": sc.__file__}
+    files = {"chained_prompts_csv": design.CHAINED_CSV, "prompts_csv": design.PROMPTS_CSV,
+             "stimuli_csv": design.STIMULI_CSV, "decision_text": dt.__file__,
+             "design": design.__file__, "core": core.__file__,
+             "chained_runner": __file__, "backend": backend_file}
     return {
         "analysis": "Chained Bai-style experiment: Task 1 WAT -> Task 2 profiles "
                     "-> Task 3 relative decision, with Task-1 hidden states",
-        "analysis_version": ANALYSIS_VERSION[model_key],
+        "analysis_version": analysis_version,
         "model": model_key,
         "generated": datetime.now(timezone.utc).isoformat(),
         "inputs": {k: {"path": os.path.relpath(v, ROOT),
-                       "sha256": mc.file_digest(v)} for k, v in files.items()},
+                       "sha256": design.file_digest(v)} for k, v in files.items()},
         "n_prompts": len(rows),
         "backend": backend_meta,
         "transformers_version": transformers.__version__,
@@ -583,7 +540,7 @@ def build_manifest(*, model_key, backend_meta, n_hidden_states, args, rows,
             "layer0": "hidden_states[0], the input embedding",
             "layer1..layerN": "output of transformer block 1..N (layerN after the "
                               "final norm)"},
-        "system_prompt": lh.SYSTEM_PROMPT,
+        "system_prompt": core.SYSTEM_PROMPT,
         "chat_template": "apply_chat_template([system, user], tokenize=False, "
                          "add_generation_prompt=True), then tokenizer(templated) — "
                          "the WAT-only pipeline",
@@ -593,17 +550,17 @@ def build_manifest(*, model_key, backend_meta, n_hidden_states, args, rows,
                            "run's; `truncated` flags rows that hit max_new_tokens",
         "max_new_tokens": {
             "chained": args.max_new_tokens,
-            "wat_only": lh.GENERATION["max_new_tokens"],
+            "wat_only": core.GENERATION["max_new_tokens"],
             "why_different": "the chained continuation holds three task answers "
                              "(the WAT assignment, two profiles and the decision) "
                              "where the WAT-only run generated the WAT answer only"},
-        "generation_seed_rule": lh.SEED_RULE,
+        "generation_seed_rule": core.SEED_RULE,
         "generation_seed_base": args.seed,
         "hidden_states_from": "the input prompt only, Task-1 window only",
         "task1_window": "character range of the WAT text inside the user message "
                         "(chained_prompts.csv task1_start/task1_end); spans "
                         "outside it are never resolved",
-        "pooling": lh.POOLING,
+        "pooling": core.POOLING,
         "pooling_rule": "mean over every sub-token of the stimulus phrase",
         "orientation": {
             "gender": "X = male, Y = female, A = brilliance, B = condition control",
@@ -642,23 +599,23 @@ def build_manifest(*, model_key, backend_meta, n_hidden_states, args, rows,
 # =========================================================
 
 def load_design(path=None):
-    stim = mk.load_stimuli()
-    rows = mc.read_chained(path or mc.CHAINED_CSV)
-    fresh = mc.build_chained(stim)
+    stim = design.load_stimuli()
+    rows = design.read_chained(path or design.CHAINED_CSV)
+    fresh = design.build_chained(stim)
     if rows != [{c: (int(v) if c in ("trial", "task1_start", "task1_end") else v)
                  for c, v in r.items()} for r in fresh]:
-        raise SystemExit(f"{path or mc.CHAINED_CSV} differs from the regenerated "
+        raise SystemExit(f"{path or design.CHAINED_CSV} differs from the regenerated "
                          f"design; refusing to run on it")
     return stim, rows
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
-    ap.add_argument("--model", required=True, choices=MODELS)
+    ap.add_argument("--model", required=True, choices=backends.names())
     ap.add_argument("--checkpoint", default=None)
     ap.add_argument("--gpu", type=int, default=0, help="llama31 only")
     ap.add_argument("--out-dir", default=None)
-    ap.add_argument("--seed", type=int, default=lh.SEED_BASE)
+    ap.add_argument("--seed", type=int, default=core.SEED_BASE)
     ap.add_argument("--max-new-tokens", type=int, default=CHAINED_MAX_NEW_TOKENS)
     ap.add_argument("--domain", choices=("gender", "fab", "both"), default="both")
     ap.add_argument("--limit", type=int, default=None)
@@ -675,7 +632,8 @@ def main():
     ap.add_argument("--judge-provider", default=None)
     ap.add_argument("--judge-model", default=None)
     args = ap.parse_args()
-    out_dir = args.out_dir or OUT_DIRS[args.model]
+    backend_module = backends.get_backend(args.model)     # the only model choice
+    out_dir = args.out_dir or backend_module.CHAINED_OUT_DIR
     check_out_dir(out_dir)
 
     if args.judge:
@@ -683,8 +641,8 @@ def main():
 
     stim, rows = load_design()
     print(f"Chained Bai-style experiment — {args.model}  "
-          f"(analysis {ANALYSIS_VERSION[args.model]})")
-    print(f"  design     : {mc.CHAINED_CSV}  ({len(rows)} chained prompts)")
+          f"(analysis {backend_module.CHAINED_ANALYSIS_VERSION})")
+    print(f"  design     : {design.CHAINED_CSV}  ({len(rows)} chained prompts)")
     if args.domain != "both":
         rows = [r for r in rows if r["domain"] == args.domain]
     if args.smoke_test:
@@ -693,7 +651,7 @@ def main():
     elif args.limit:
         rows = rows[:args.limit]
     for r in rows:
-        lh.prompt_roles(r, stim)
+        core.prompt_roles(r, stim)
         if r["prompt"][r["task1_start"]:r["task1_end"]] != r["task1_prompt"]:
             raise SystemExit(f"{r['prompt_id']}: Task-1 window broken")
     print(f"  roles and Task-1 windows checked for {len(rows)} prompts")
@@ -702,17 +660,18 @@ def main():
         print("\n--dry-run: design validated, no model loaded, nothing written.")
         return
 
-    backend = load_backend(args.model, args)
-    print(f"  loaded {backend['meta']['model_class']} "
-          f"({backend['meta']['n_transformer_blocks']} blocks)")
+    backend = backend_module.load(args.checkpoint, args.gpu)
+    print(f"  loaded {backend.meta['model_class']} "
+          f"({backend.meta['n_transformer_blocks']} blocks)")
     if args.smoke_test:
         return smoke_test(rows, stim, backend, args)
 
-    acc = lh.PrototypeAccumulator()
+    acc = core.PrototypeAccumulator()
     out, beh, dec, meta = run_prompts(rows, stim, backend, args=args, acc=acc)
     n_hidden = meta["n_hidden_states"]
-    stim_rows = stimulus_rows(acc, rows, stim, args.model)
-    set_rows = set_weat_rows(stim_rows, stim, args.model)
+    version = backend_module.CHAINED_ANALYSIS_VERSION
+    stim_rows = stimulus_rows(acc, rows, stim, args.model, version)
+    set_rows = set_weat_rows(stim_rows, stim, args.model, version)
 
     os.makedirs(out_dir, exist_ok=True)
     write_table(os.path.join(out_dir, PROMPT_WEAT_CSV), out,
@@ -729,12 +688,14 @@ def main():
     np.savez_compressed(os.path.join(out_dir, PROTOTYPES_NPZ),
                         **{f"{d}|{a}|{s}": acc.prototype(d, a, s)
                            for (d, a, s) in acc.sums})
-    tok = backend["tokenizer"]
-    first, _ = lh.build_chat_input(tok, lh.SYSTEM_PROMPT, rows[0]["prompt"])
-    manifest = build_manifest(model_key=args.model, backend_meta=backend["meta"],
+    tok = backend.tokenizer
+    first, _ = core.build_chat_input(tok, core.SYSTEM_PROMPT, rows[0]["prompt"])
+    manifest = build_manifest(model_key=args.model, analysis_version=version,
+                              backend_file=backend_module.__file__,
+                              backend_meta=backend.meta,
                               n_hidden_states=n_hidden, args=args, rows=out,
                               n_behaviour_failures=len(beh),
-                              bos=sc.bos_record(tok, first))
+                              bos=core.bos_record(tok, first))
     with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, default=str)
     print(f"  wrote {os.path.join(out_dir, 'manifest.json')}")
@@ -784,7 +745,7 @@ def judge_stage(args, out_dir):
 
 def smoke_test(rows, stim, backend, args):
     import torch
-    tok = backend["tokenizer"]
+    tok = backend.tokenizer
     for row in rows:
         print(f"\n{'=' * 74}\nSMOKE — {row['prompt_id']}\n{'=' * 74}")
         print(row["prompt"])
@@ -798,7 +759,7 @@ def smoke_test(rows, stim, backend, args):
         print(f"  behaviour_wat_score  : {out['behaviour_wat_score']}"
               f"  {out['behaviour_parse_error']}")
         print(f"  hidden states        : {meta['n_hidden_states']}")
-        templated, uw = lh.build_chat_input(tok, lh.SYSTEM_PROMPT, row["prompt"])
+        templated, uw = core.build_chat_input(tok, core.SYSTEM_PROMPT, row["prompt"])
         win = task1_window(templated, uw, row)
         for phrase, (lo, hi) in meta["spans"].items():
             print(f"    {phrase:<26} tokens [{lo}, {hi})  {meta['subtokens'][phrase]}"

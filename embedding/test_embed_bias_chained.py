@@ -4,9 +4,9 @@ Tests for the chained Task 1 -> Task 2 -> Task 3 experiment.
     python3 embedding/test_embed_bias_chained.py            # all tests
     python3 embedding/test_embed_bias_chained.py section    # name filter
 
-Covers the frozen chained design (`make_chained_prompts.py`), the refactored
+Covers the frozen chained design (`embedding/design.py`), the refactored
 decision text (`decision_text.py`) and the chained runner
-(`embed_bias_chained_hidden.py`).  Nothing loads a model: the tokenizer and the
+(`embedding/chained_hidden.py`).  Nothing loads a model: the tokenizer and the
 model are the fakes from `test_embed_bias_llama3.py`, and the Task-3 judge is a
 scripted function.  The WAT-only suites (`test_embed_bias_llama3.py`,
 `test_embed_bias.py`) are run separately and unchanged.
@@ -30,18 +30,16 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 sys.path.insert(0, ROOT)
 
-import embed_bias_chained_hidden as ch
-import embed_bias_llama3_hidden as lh
-import embed_bias_scout_hidden as sc
-import make_bai_style_prompts as mk
-import make_chained_prompts as mc
+from embedding import core, design
+from embedding import chained_hidden as ch
+from embedding.backends import llama_31, llama_scout
 import decision_text as dt
 import test_embed_bias_llama3 as tl          # fakes
 
-STIM = mk.load_stimuli()
-CHAINED = mc.read_chained()
+STIM = design.load_stimuli()
+CHAINED = design.read_chained()
 BY_ID = {r["prompt_id"]: r for r in CHAINED}
-WAT = mk.read_prompts()
+WAT = design.read_prompts()
 
 
 # =========================================================
@@ -53,34 +51,46 @@ class FakeArgs:
         self.seed, self.max_new_tokens = seed, max_new_tokens
 
 
-def fake_backend(responses, *, n_blocks=4, dim=8, extract=None, model_key="scout"):
+class FakeBackend:
     """
-    A backend whose generate() replays responses[prompt_id] and whose extract()
-    is the real lh.extract_prompt_vectors over the fake model (or `extract`).
+    The backend interface over the test fakes: generate() replays
+    responses[prompt_id] through llama_31.generate_response, and extract_hidden()
+    is the real llama_31.extract_prompt_vectors over the fake model (or
+    `extract(templated, phrases, window, context)`).
     """
-    tok = tl.FakeTokenizer()
-    state = {}
 
-    def generate(templated, seed, cfg):
-        pid = next(p for p in responses if BY_ID[p]["prompt"] in templated)
-        model = tl.FakeModel(n_blocks=n_blocks, dim=dim, response=responses[pid],
-                             tokenizer=tok)
-        state["model"] = model
-        return lh.generate_response(templated, tok, model, seed=seed, generation=cfg)
+    def __init__(self, responses, *, n_blocks=4, dim=8, extract=None,
+                 model_key="scout"):
+        self.name = model_key
+        self.tokenizer = tl.FakeTokenizer()
+        self.meta = dict(n_transformer_blocks=n_blocks, model_class="Fake")
+        self._responses, self._n_blocks, self._dim = responses, n_blocks, dim
+        self._extract = extract
 
-    def real_extract(templated, phrases, window, context):
-        model = tl.FakeModel(n_blocks=n_blocks, dim=dim, tokenizer=tok)
-        return lh.extract_prompt_vectors(templated, phrases, tok, model,
-                                         user_window=window, competitors=phrases,
-                                         context=context)
+    def generate(self, templated, *, seed, generation=None):
+        pid = next(p for p in self._responses if BY_ID[p]["prompt"] in templated)
+        model = tl.FakeModel(n_blocks=self._n_blocks, dim=self._dim,
+                             response=self._responses[pid], tokenizer=self.tokenizer)
+        return llama_31.generate_response(templated, self.tokenizer, model, seed=seed,
+                                          generation=generation)
 
-    return dict(model_key=model_key, tokenizer=tok, generate=generate,
-                extract=extract or real_extract,
-                meta=dict(n_transformer_blocks=n_blocks, model_class="Fake"))
+    def extract_hidden(self, templated, phrases, *, user_window, competitors,
+                       context=""):
+        if self._extract is not None:
+            return self._extract(templated, phrases, user_window, context)
+        model = tl.FakeModel(n_blocks=self._n_blocks, dim=self._dim,
+                             tokenizer=self.tokenizer)
+        return llama_31.extract_prompt_vectors(templated, phrases, self.tokenizer, model,
+                                               user_window=user_window,
+                                               competitors=competitors, context=context)
+
+
+def fake_backend(responses, **kw):
+    return FakeBackend(responses, **kw)
 
 
 def wat_answer(row, congruent=True):
-    roles = lh.prompt_roles(row, STIM)
+    roles = core.prompt_roles(row, STIM)
     lines = []
     for item in roles["attributes"]:
         to_x = (item in roles["A"]) == congruent
@@ -119,8 +129,8 @@ def test_the_chained_design_has_272_unique_prompt_ids():
 
 
 def test_the_chained_design_is_deterministic_and_matches_the_file():
-    fresh = mc.build_chained(STIM)
-    assert fresh == mc.build_chained(STIM)
+    fresh = design.build_chained(STIM)
+    assert fresh == design.build_chained(STIM)
     assert [{c: (int(v) if c in ("trial", "task1_start", "task1_end") else v)
              for c, v in r.items()} for r in fresh] == CHAINED
 
@@ -132,8 +142,8 @@ def test_the_wat_only_design_is_byte_for_byte_unchanged():
         assert head.returncode == 0, head.stderr
         disk = open(os.path.join(ROOT, rel), "rb").read()
         assert hashlib.sha256(disk).digest() == hashlib.sha256(head.stdout).digest(), rel
-    assert WAT == mk.build_prompts(STIM, seed=0)
-    assert mc.CHAINED_CSV != mk.PROMPTS_CSV
+    assert WAT == design.build_prompts(STIM, seed=0)
+    assert design.CHAINED_CSV != design.PROMPTS_CSV
 
 
 def test_task1_is_the_frozen_wat_prompt_with_its_order_and_coverage():
@@ -150,7 +160,7 @@ def test_task1_is_the_frozen_wat_prompt_with_its_order_and_coverage():
         assert r["task1_end"] < r["prompt"].index("Task 2: ") \
             < r["prompt"].index("Task 3: ")
         assert "Task 1" not in r["prompt"][:r["task1_end"]]
-    for cat in mk.GENDER_CONDITIONS:
+    for cat in design.GENDER_CONDITIONS:
         rs = [r for r in CHAINED if r["category"] == cat]
         pairs = {(r["t3_x"], r["t3_y"]) for r in rs}
         assert pairs == {(m, f) for m in STIM["gender"]["male"]
@@ -169,11 +179,11 @@ def test_task2_and_task3_are_the_decision_tasks_own_wording():
             t3 = dt.adj_decision_task(p0, p1, o0, o1, r["t3_frame"])
             assert r["t3_frame"] == "be" and r["t3_relation"] == "none"
         else:
-            t2 = mc.fab_attribution_profile_task(p0, p1)
+            t2 = design.fab_attribution_profile_task(p0, p1)
             t3 = dt.fab_decision_task(o0, o1)
-        assert r["prompt"] == (r["task1_prompt"] + mc.TASK1_SEPARATOR
-                               + mc.TASK1_SCOPE + f"\n\nTask 2: {t2}\n\nTask 3: "
-                               f"{t3}\n\n" + mc.SECTION_INSTRUCTION), r["prompt_id"]
+        assert r["prompt"] == (r["task1_prompt"] + design.TASK1_SEPARATOR
+                               + design.TASK1_SCOPE + f"\n\nTask 2: {t2}\n\nTask 3: "
+                               f"{t3}\n\n" + design.SECTION_INSTRUCTION), r["prompt_id"]
         assert "You will be asked" not in r["prompt"]
 
 
@@ -205,7 +215,7 @@ def test_the_two_task_builders_still_render_the_original_prompts():
 # =========================================================
 
 def test_gender_descriptor_pairs_are_exactly_balanced():
-    for cat in mk.GENDER_CONDITIONS:
+    for cat in design.GENDER_CONDITIONS:
         rs = [r for r in CHAINED if r["category"] == cat]
         A = STIM["gender"]["brilliance"]
         B = STIM["gender"]["control"][cat]
@@ -253,7 +263,7 @@ def test_fab_field_schedule_is_as_balanced_as_possible():
 
 
 def test_option_and_person_order_are_independent_of_orientation():
-    for label in list(mk.GENDER_CONDITIONS) + ["fab"]:
+    for label in list(design.GENDER_CONDITIONS) + ["fab"]:
         rs = [r for r in CHAINED if r["category"] == label]
         cells = Counter((r["task1_order"], r["person_order"], r["option_order"])
                         for r in rs)
@@ -268,22 +278,22 @@ def test_option_and_person_order_are_independent_of_orientation():
 
 
 def test_the_schedule_assertions_fire_on_a_broken_design():
-    rows = [dict(r) for r in mc.build_chained(STIM)]
+    rows = [dict(r) for r in design.build_chained(STIM)]
     g = [r for r in rows if r["category"] == "humor"]
     g[0]["t3_b"], g[1]["t3_b"] = g[1]["t3_b"], g[0]["t3_b"]
     if (g[0]["t3_a"], g[0]["t3_b"]) == (g[1]["t3_a"], g[1]["t3_b"]):
         g[0]["t3_a"] = g[2]["t3_a"] if g[2]["t3_a"] != g[0]["t3_a"] else g[3]["t3_a"]
     try:
-        mc.validate_chained(rows, WAT, STIM)
+        design.validate_chained(rows, WAT, STIM)
     except AssertionError:
         pass
     else:
         raise AssertionError("a broken descriptor schedule passed validation")
-    rows = [dict(r) for r in mc.build_chained(STIM)]
+    rows = [dict(r) for r in design.build_chained(STIM)]
     f = [r for r in rows if r["domain"] == "fab"]
     f[0]["t3_a"] = f[1]["t3_a"] = f[2]["t3_a"]
     try:
-        mc.validate_chained(rows, WAT, STIM)
+        design.validate_chained(rows, WAT, STIM)
     except AssertionError:
         return
     raise AssertionError("a broken FAB schedule passed validation")
@@ -296,9 +306,9 @@ def test_the_schedule_assertions_fire_on_a_broken_design():
 def test_task1_spans_never_select_task2_or_task3_occurrences():
     for row in (gender_row("warmth", 1), gender_row("dedication", 30), fab_row(1)):
         tok = tl.FakeTokenizer()
-        templated, uw = lh.build_chat_input(tok, lh.SYSTEM_PROMPT, row["prompt"])
+        templated, uw = core.build_chat_input(tok, core.SYSTEM_PROMPT, row["prompt"])
         win = ch.task1_window(templated, uw, row)
-        roles = lh.prompt_roles(row, STIM)
+        roles = core.prompt_roles(row, STIM)
         enc = tok(templated, return_offsets_mapping=True)
         offs = ch.token_offsets(tok, templated)
         later = templated[win[1]:]
@@ -307,9 +317,9 @@ def test_task1_spans_never_select_task2_or_task3_occurrences():
         for p in repeated:
             # over the whole user message the repeat makes the span ambiguous ...
             try:
-                lh.resolve_span(templated, offs, p, window=uw,
+                core.resolve_span(templated, offs, p, window=uw,
                                 competitors=[c for c in roles["phrases"] if c != p])
-            except lh.SpanError:
+            except core.SpanError:
                 pass
             else:
                 raise AssertionError(f"{p!r} should be ambiguous outside Task 1")
@@ -324,7 +334,7 @@ def test_a_wrong_task1_window_is_refused():
     row["task1_start"] += 5
     try:
         run(row, chained_response(gender_row()))
-    except lh.SpanError as exc:
+    except core.SpanError as exc:
         assert "Task-1 window" in str(exc)
         return
     raise AssertionError("a misaligned Task-1 window was accepted")
@@ -388,7 +398,7 @@ def test_a_malformed_response_keeps_the_row_and_its_representation():
 
 def test_the_wat_is_scored_from_response_1_only():
     row = gender_row("warmth", 5)
-    roles = lh.prompt_roles(row, STIM)
+    roles = core.prompt_roles(row, STIM)
     # Task 2 and 3 contain WAT-shaped lines that would fail or flip the score
     noise = "\n".join(f"{a} - {roles['Y']}" for a in roles["A"])
     out, bf, _, _ = run(row, chained_response(row, congruent=True, t2=noise, t3=noise))
@@ -472,7 +482,7 @@ def test_unclear_or_failed_judging_is_nan_and_logged():
 def oriented_extract(templated, phrases, window, context, *, n=5, dim=6):
     """X aligned with A, Y aligned with B, at every hidden state."""
     row = next(r for r in CHAINED if r["prompt"] in templated)
-    roles = lh.prompt_roles(row, STIM)
+    roles = core.prompt_roles(row, STIM)
     e = np.eye(dim)
     rng = np.random.default_rng(len(context))
     vec = {}
@@ -483,7 +493,7 @@ def oriented_extract(templated, phrases, window, context, *, n=5, dim=6):
     tok = tl.FakeTokenizer()
     offs = ch.token_offsets(tok, templated)
     for p in phrases:
-        spans[p] = lh.resolve_span(templated, offs, p, window=window,
+        spans[p] = core.resolve_span(templated, offs, p, window=window,
                                    competitors=[c for c in phrases if c != p])
     return vec, dict(n_hidden_states=n, n_transformer_blocks=n - 1, hidden_size=dim,
                      n_prompt_tokens=len(offs), pooling="mean", forward_seconds=0.0,
@@ -515,36 +525,36 @@ def test_all_four_scores_share_the_stereotype_congruent_orientation():
 # =========================================================
 
 def test_set_weat_reproduces_the_conventional_formula():
-    acc = lh.PrototypeAccumulator()
+    acc = core.PrototypeAccumulator()
     picks = [r for r in CHAINED if r["category"] == "humor"][:6] + \
         [r for r in CHAINED if r["domain"] == "fab"][:5]
     for row in picks:
         be = fake_backend({row["prompt_id"]: chained_response(row)}, n_blocks=3, dim=7)
         ch.run_one(row, STIM, be, args=FakeArgs(), acc=acc)
-    stim_rows = ch.stimulus_rows(acc, picks, STIM, "scout")
-    set_rows = ch.set_weat_rows(stim_rows, STIM, "scout")
+    stim_rows = ch.stimulus_rows(acc, picks, STIM, "scout", llama_scout.CHAINED_ANALYSIS_VERSION)
+    set_rows = ch.set_weat_rows(stim_rows, STIM, "scout", llama_scout.CHAINED_ANALYSIS_VERSION)
     assert len(set_rows) == 2 * 4
     for r in set_rows:
-        arm = lh.arm_for(r["domain"], r["category"], STIM)
+        arm = core.arm_for(r["domain"], r["category"], STIM)
         i = r["hidden_state_index"]
         P = {role: np.asarray([acc.prototype(r["domain"], r["category"], w)[i]
                                for w in arm[role] if acc.n(r["domain"], r["category"], w)])
              for role in "XYAB"}
-        sX = [float(np.mean([tl.eb.cos_sim(x[None], a[None])[0, 0] for a in P["A"]])
-                    - np.mean([tl.eb.cos_sim(x[None], b[None])[0, 0] for b in P["B"]]))
+        sX = [float(np.mean([core.cos_sim(x[None], a[None])[0, 0] for a in P["A"]])
+                    - np.mean([core.cos_sim(x[None], b[None])[0, 0] for b in P["B"]]))
               for x in P["X"]]
-        sY = [float(np.mean([tl.eb.cos_sim(y[None], a[None])[0, 0] for a in P["A"]])
-                    - np.mean([tl.eb.cos_sim(y[None], b[None])[0, 0] for b in P["B"]]))
+        sY = [float(np.mean([core.cos_sim(y[None], a[None])[0, 0] for a in P["A"]])
+                    - np.mean([core.cos_sim(y[None], b[None])[0, 0] for b in P["B"]]))
               for y in P["Y"]]
         want = (np.mean(sX) - np.mean(sY)) / np.std(sX + sY, ddof=0)
         assert math.isclose(r["weat_score"], want, rel_tol=1e-9), (r, want)
         assert math.isclose(r["weat_score"],
-                            lh.weat_effect_size_hidden(P["X"], P["Y"], P["A"], P["B"]),
+                            core.weat_effect_size_hidden(P["X"], P["Y"], P["A"], P["B"]),
                             rel_tol=1e-9)
         assert (r["n_X"], r["n_Y"]) == (len(P["X"]), len(P["Y"]))
     for r in stim_rows:
         assert r["prototype_file"] == ch.PROTOTYPES_NPZ
-        assert r["analysis_version"] == ch.ANALYSIS_VERSION["scout"]
+        assert r["analysis_version"] == llama_scout.CHAINED_ANALYSIS_VERSION
 
 
 # =========================================================
@@ -564,12 +574,12 @@ def test_the_output_schema_uses_the_fixed_notation():
                  "delta_layer0", "weat_score_layer48"):
         assert need in cols, need
     assert "weat_layer0" not in cols
-    acc = lh.PrototypeAccumulator()
+    acc = core.PrototypeAccumulator()
     row = fab_row(2)
     ch.run_one(row, STIM, fake_backend({row["prompt_id"]: chained_response(row)}),
                args=FakeArgs(), acc=acc)
-    stim_rows = ch.stimulus_rows(acc, [row], STIM, "llama31")
-    set_rows = ch.set_weat_rows(stim_rows, STIM, "llama31")
+    stim_rows = ch.stimulus_rows(acc, [row], STIM, "llama31", llama_31.CHAINED_ANALYSIS_VERSION)
+    set_rows = ch.set_weat_rows(stim_rows, STIM, "llama31", llama_31.CHAINED_ANALYSIS_VERSION)
     names = (cols + list(stim_rows[0]) + list(set_rows[0]) + ch.OUTPUT_FILES)
     for name in names:
         for b in BANNED:
@@ -597,10 +607,10 @@ def test_33_and_49_level_models_give_33_and_49_layer_columns():
 def test_a_wrong_hidden_state_count_aborts():
     row = gender_row()
     be = fake_backend({row["prompt_id"]: chained_response(row)}, n_blocks=4)
-    be["meta"]["n_transformer_blocks"] = 32
+    be.meta["n_transformer_blocks"] = 32
     try:
         ch.run_one(row, STIM, be, args=FakeArgs())
-    except sc.ArchitectureMismatch:
+    except core.ArchitectureMismatch:
         return
     raise AssertionError("a 5-state forward was accepted for a 32-block config")
 
@@ -609,11 +619,11 @@ def test_generation_keeps_the_wat_only_sampling_and_seed():
     row = gender_row("warmth", 3)
     be = fake_backend({row["prompt_id"]: chained_response(row)})
     out, _, _, _ = ch.run_one(row, STIM, be, args=FakeArgs())
-    assert out["seed"] == lh.prompt_seed(row["prompt_id"], 0)
-    assert out["temperature"] == lh.GENERATION["temperature"] == 0.3
+    assert out["seed"] == core.prompt_seed(row["prompt_id"], 0)
+    assert out["temperature"] == core.GENERATION["temperature"] == 0.3
     cfg = ch.generation_config(FakeArgs())
     for k in ("do_sample", "temperature", "top_p", "top_k"):
-        assert cfg[k] == lh.GENERATION[k]
+        assert cfg[k] == core.GENERATION[k]
 
 
 def test_the_judge_stage_round_trip_leaves_representations_untouched():
@@ -644,9 +654,9 @@ def test_the_chained_runner_never_writes_to_wat_only_directories():
         except SystemExit:
             continue
         raise AssertionError(f"{d} accepted")
-    assert ch.OUT_DIRS["llama31"].endswith("embed_llama31_chained")
-    assert ch.OUT_DIRS["scout"].endswith("embed_scout_chained")
-    ch.check_out_dir(ch.OUT_DIRS["scout"])
+    assert llama_31.CHAINED_OUT_DIR.endswith("embed_llama31_chained")
+    assert llama_scout.CHAINED_OUT_DIR.endswith("embed_scout_chained")
+    ch.check_out_dir(llama_scout.CHAINED_OUT_DIR)
 
 
 def test_no_pca_or_replay_path_in_the_chained_code():
@@ -664,7 +674,7 @@ def test_no_pca_or_replay_path_in_the_chained_code():
 def _raw_prompts_csv():
     """prompts.csv read with the csv module only — no normalisation at all."""
     import csv
-    with open(mk.PROMPTS_CSV, newline="", encoding="utf-8") as f:
+    with open(design.PROMPTS_CSV, newline="", encoding="utf-8") as f:
         return {r["prompt_id"]: r["prompt"] for r in csv.DictReader(f)}
 
 
@@ -674,18 +684,18 @@ def test_every_chained_prompt_begins_with_the_exact_prompts_csv_prompt():
     for r in CHAINED:
         w = raw[r["prompt_id"]]
         assert r["prompt"].encode("utf-8")[:len(w.encode("utf-8"))] == w.encode("utf-8")
-        assert r["prompt"][len(w):].startswith(mc.TASK1_SEPARATOR + mc.TASK1_SCOPE)
+        assert r["prompt"][len(w):].startswith(design.TASK1_SEPARATOR + design.TASK1_SCOPE)
         assert r["task1_prompt"] == w
 
 
 def test_the_validator_rejects_a_prefix_that_is_only_equivalent():
-    rows = [dict(r) for r in mc.build_chained(STIM)]
+    rows = [dict(r) for r in design.build_chained(STIM)]
     r = rows[10]
     alt = r["task1_prompt"].replace(" — ", " - ", 1)          # same meaning
     r["prompt"] = alt + r["prompt"][len(r["task1_prompt"]):]
     r["task1_end"] = len(alt)
     try:
-        mc.validate_chained(rows, WAT, STIM)
+        design.validate_chained(rows, WAT, STIM)
     except AssertionError as exc:
         assert "exact" in str(exc)
         return
@@ -693,19 +703,19 @@ def test_the_validator_rejects_a_prefix_that_is_only_equivalent():
 
 
 def test_the_scope_clarification_follows_the_wat_prompt():
-    assert '"Do not include any additional text in your response"' in mc.TASK1_SCOPE
-    assert "only" in mc.TASK1_SCOPE and "Task 1" in mc.TASK1_SCOPE
+    assert '"Do not include any additional text in your response"' in design.TASK1_SCOPE
+    assert "only" in design.TASK1_SCOPE and "Task 1" in design.TASK1_SCOPE
     for label in ('"Task 1:"', '"Task 2:"', '"Task 3:"'):
-        assert label in mc.SECTION_INSTRUCTION
+        assert label in design.SECTION_INSTRUCTION
     for r in CHAINED:
         tail = r["prompt"][r["task1_end"]:]
-        assert tail.index(mc.TASK1_SCOPE) < tail.index("Task 2: ")
-        assert tail.endswith(mc.SECTION_INSTRUCTION)
+        assert tail.index(design.TASK1_SCOPE) < tail.index("Task 2: ")
+        assert tail.endswith(design.SECTION_INSTRUCTION)
 
 
 def _prefix_ids(tok, wat_prompt, chained_prompt):
-    a, ua = lh.build_chat_input(tok, lh.SYSTEM_PROMPT, wat_prompt)
-    b, ub = lh.build_chat_input(tok, lh.SYSTEM_PROMPT, chained_prompt)
+    a, ua = core.build_chat_input(tok, core.SYSTEM_PROMPT, wat_prompt)
+    b, ub = core.build_chat_input(tok, core.SYSTEM_PROMPT, chained_prompt)
     assert ua[0] == ub[0] and a[:ua[1]] == b[:ub[0] + len(wat_prompt)]
     end = ua[0] + len(wat_prompt)
     ida = list(tok(a)["input_ids"]); idb = list(tok(b)["input_ids"])
@@ -718,9 +728,9 @@ def _prefix_ids(tok, wat_prompt, chained_prompt):
 
 def test_task1_prefix_token_ids_are_identical_to_the_wat_only_input():
     tokenizers = [("fake", tl.FakeTokenizer())]
-    if os.path.isfile(os.path.join(sc.CHECKPOINT, "tokenizer.json")):
+    if os.path.isfile(os.path.join(llama_scout.CHECKPOINT, "tokenizer.json")):
         from transformers import AutoTokenizer
-        tokenizers.append(("scout", AutoTokenizer.from_pretrained(sc.CHECKPOINT)))
+        tokenizers.append(("scout", AutoTokenizer.from_pretrained(llama_scout.CHECKPOINT)))
     else:
         print("    (Scout tokenizer absent: fake tokenizer only)")
     raw = _raw_prompts_csv()
@@ -733,15 +743,15 @@ def test_task1_prefix_token_ids_are_identical_to_the_wat_only_input():
 
 def test_a_bare_blank_line_would_have_merged_into_the_last_wat_token():
     """Why TASK1_SEPARATOR starts with a space (real tokenizer only)."""
-    if not os.path.isfile(os.path.join(sc.CHECKPOINT, "tokenizer.json")):
+    if not os.path.isfile(os.path.join(llama_scout.CHECKPOINT, "tokenizer.json")):
         print("    (skipped: no Scout tokenizer)")
         return
     from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained(sc.CHECKPOINT)
+    tok = AutoTokenizer.from_pretrained(llama_scout.CHECKPOINT)
     w = WAT[0]["prompt"]
-    a, b, _ = _prefix_ids(tok, w, w + "\n\n" + mc.TASK1_SCOPE)
+    a, b, _ = _prefix_ids(tok, w, w + "\n\n" + design.TASK1_SCOPE)
     assert a != b
-    a, b, clean = _prefix_ids(tok, w, w + mc.TASK1_SEPARATOR + mc.TASK1_SCOPE)
+    a, b, clean = _prefix_ids(tok, w, w + design.TASK1_SEPARATOR + design.TASK1_SCOPE)
     assert a == b and clean
 
 
@@ -772,13 +782,13 @@ class CausalMock:
 def test_a_causal_model_gives_identical_task1_vectors_in_both_designs():
     raw = _raw_prompts_csv()
     for row in (gender_row("creativity", 12), gender_row("humor", 40), fab_row(9)):
-        roles = lh.prompt_roles(row, STIM)
+        roles = core.prompt_roles(row, STIM)
         vec = {}
         for name, prompt in (("wat", raw[row["prompt_id"]]), ("chained", row["prompt"])):
             tok = tl.FakeTokenizer()
-            templated, uw = lh.build_chat_input(tok, lh.SYSTEM_PROMPT, prompt)
+            templated, uw = core.build_chat_input(tok, core.SYSTEM_PROMPT, prompt)
             window = (uw[0], uw[0] + len(raw[row["prompt_id"]]))
-            vec[name], _ = lh.extract_prompt_vectors(
+            vec[name], _ = llama_31.extract_prompt_vectors(
                 templated, roles["phrases"], tok, CausalMock(), user_window=window,
                 competitors=roles["phrases"])
         for p in roles["phrases"]:
@@ -818,15 +828,15 @@ def test_fab_people_use_the_attribution_frame_with_verbatim_poles():
 # =========================================================
 
 def test_stimulus_layer_keeps_the_xyab_role_column():
-    acc = lh.PrototypeAccumulator()
+    acc = core.PrototypeAccumulator()
     picks = [gender_row("warmth", 1), gender_row("warmth", 2), fab_row(1)]
     for row in picks:
         ch.run_one(row, STIM, fake_backend({row["prompt_id"]: chained_response(row)}),
                    args=FakeArgs(), acc=acc)
-    rows = ch.stimulus_rows(acc, picks, STIM, "scout")
+    rows = ch.stimulus_rows(acc, picks, STIM, "scout", llama_scout.CHAINED_ANALYSIS_VERSION)
     assert {r["role"] for r in rows} == {"X", "Y", "A", "B"}
     for r in rows:
-        arm = lh.arm_for(r["domain"], r["category"], STIM)
+        arm = core.arm_for(r["domain"], r["category"], STIM)
         assert r["stimulus"] in arm[r["role"]], r
         assert r["prototype_file"] == "stimulus_prototypes.npz"
 
@@ -835,15 +845,16 @@ def test_the_manifest_records_why_max_new_tokens_differs():
     import argparse
     args = argparse.Namespace(model="scout", seed=0,
                               max_new_tokens=ch.CHAINED_MAX_NEW_TOKENS)
-    m = ch.build_manifest(model_key="scout",
+    m = ch.build_manifest(model_key="scout", analysis_version=llama_scout.CHAINED_ANALYSIS_VERSION,
+                          backend_file=llama_scout.__file__,
                           backend_meta=dict(n_transformer_blocks=48),
                           n_hidden_states=49, args=args, rows=[],
                           n_behaviour_failures=0, bos={})
     assert m["max_new_tokens"]["chained"] == 1024
-    assert m["max_new_tokens"]["wat_only"] == lh.GENERATION["max_new_tokens"] == 512
+    assert m["max_new_tokens"]["wat_only"] == core.GENERATION["max_new_tokens"] == 512
     assert "three task" in m["max_new_tokens"]["why_different"]
     for k in ("do_sample", "temperature", "top_p", "top_k"):
-        assert m["generation"][k] == lh.GENERATION[k]
+        assert m["generation"][k] == core.GENERATION[k]
     assert m["generation"]["temperature"] == 0.3
 
 
